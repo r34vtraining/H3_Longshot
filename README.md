@@ -1,5 +1,7 @@
 # ComfyUI — MiniMax H3 Long Shot
 
+Requires the [H3 Prompt Compiler](https://github.com/r34vtraining/H3_Prompt_Compiler) pack (for the Shot and Ref Prompt Builder r2v nodes) and a ComfyUI build with native MiniMax H3, arbitrary-frame guides, and the V3 node API.
+
 Render one continuous shot longer than a single H3 generation. Each **Shot**
 node in a chain becomes one generation; they're stitched in latent space and
 decoded once, so the joins are seamless. Optional lip sync to a song.
