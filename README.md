@@ -17,10 +17,9 @@ guides, and the V3 node API.
 
 ## Install
 
-Unzip into `custom_nodes`:
-
-```
-ComfyUI\custom_nodes\comfyui-minimax-h3-longshot\__init__.py
+cd ComfyUI/custom_nodes
+git clone https://github.com/r34vtraining/H3_Prompt_Compiler
+git clone https://github.com/r34vtraining/H3_Longshot
 ```
 
 Restart ComfyUI. No dependencies. Three nodes appear under **MiniMax H3**: Long Shot, Song Track, and RefMod Carrier.
