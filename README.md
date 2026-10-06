@@ -17,6 +17,7 @@ guides, and the V3 node API.
 
 ## Install
 
+```
 cd ComfyUI/custom_nodes
 git clone https://github.com/r34vtraining/H3_Prompt_Compiler
 git clone https://github.com/r34vtraining/H3_Longshot
