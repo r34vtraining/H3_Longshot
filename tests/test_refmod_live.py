@@ -73,3 +73,23 @@ def test_feeding_refmod_from_a_loaded_reference_node_warns(refmod, monkeypatch, 
         r = T.run(monkeypatch, [7, 7], ref_images={"ref_image_0": ref}, extra_refs=refmod_out)
     assert "counted twice" in caplog.text
     assert len(r.st.calls[0].meta["minimax_refs"]) == 4   # the image really is in twice
+
+
+def test_real_refmods_through_the_refmods_input(refmod, monkeypatch):
+    """Real H3RefMod objects: same blocks Text Encode would build, same labels as
+    the RefMod pack's own reference_map when Long Shot has no native refs."""
+    _apply, H3RefMod = refmod
+    prompt_mod = sys.modules[next(k for k in sys.modules if k.endswith(".prompt")
+                                  and hasattr(sys.modules[k], "reference_map"))]
+    mods = [(m, s) for (m, _), s in zip(_mods(H3RefMod), (1.0, 0.6))]
+    clip, vae = T.ItemClip(), T.DecodingVae()
+    r = T.run(monkeypatch, [7, 7], clip=clip, vae=vae, refmods=mods)
+
+    assert "<Picture 1> = luma_face (RefMod)" in r.out[3] and "<Video 1> = luma_walk (RefMod)" in r.out[3]
+    assert prompt_mod.reference_map(mods) == "<Picture 1> = luma_face\n<Video 1> = luma_walk"
+    for c in r.st.calls:
+        blocks = c.meta["minimax_refs"]
+        assert all(b["refmod"] for b in blocks)
+        for b, (m, s) in zip(blocks, mods):
+            assert torch.equal(b["latent"], m.ref_block(s)["latent"])
+    assert [[i["type"] for i in items] for items in clip.items] == [["image", "video"]] * 2

@@ -694,3 +694,149 @@ def test_console_summary_keeps_warnings(monkeypatch, caplog):
     with caplog.at_level(logging.INFO, logger="MiniMaxH3LongShot"):
         run(monkeypatch, [6, 16])
     assert "NOTE: Segment 2 window" in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# RefMods through the refmods input: presented to the text encoder
+# ---------------------------------------------------------------------------
+
+class FakeRefMod:
+    """Duck-types the RefMod pack's H3RefMod: name, kind, ref_block(strength)."""
+
+    def __init__(self, name, kind, latent_t=1):
+        self.name, self.kind, self.latent_t = name, kind, latent_t
+        hh, ww = H // 16, W // 16
+        if kind == "audio":
+            self.latent = torch.randn(1, 32, 2, 40)
+        else:
+            self.latent = torch.randn(1, 24, latent_t, hh, ww)
+
+    def ref_block(self, strength=1.0):
+        z = self.latent * strength
+        if self.kind == "audio":
+            return {"kind": "audio", "ref_audio_t": z.shape[-1], "audio_latent": z}
+        b = {"kind": self.kind, "latent_h": z.shape[3], "latent_w": z.shape[4], "latent": z}
+        if self.kind == "video":
+            b.update(latent_t=self.latent_t, ref_audio_t=0, audio_latent=None)
+        return b
+
+
+class DecodingVae(CountingVae):
+    """Decodes a latent to BTHWC frames (17k+5 frames per 5k+2 tokens is not
+    needed here — only the shape contract RefMod Text Encode relies on)."""
+
+    def __init__(self):
+        super().__init__()
+        self.decodes = 0
+
+    def decode(self, z):
+        self.decodes += 1
+        t = 1 if z.shape[2] == 1 else (z.shape[2] - 1) * 4 + 1
+        return torch.rand(1, t, z.shape[3] * 16, z.shape[4] * 16, 3)
+
+
+class ItemClip(MockClip):
+    def __init__(self):
+        super().__init__()
+        self.items = []
+
+    def tokenize(self, prompt, images=None, minimax_ref_items=None):
+        self.items.append(list(minimax_ref_items or []))
+        return super().tokenize(prompt, images=images)
+
+
+def mods_set():
+    return [(FakeRefMod("hero_face", "image"), 1.0),
+            (FakeRefMod("hero_walk", "video", latent_t=7), 0.8),
+            (FakeRefMod("hero_voice", "audio"), 1.0)]
+
+
+def test_refmods_take_the_next_labels_after_native_refs(monkeypatch):
+    refs, mods = ref_set(), mods_set()
+    clip, vae = ItemClip(), DecodingVae()
+    r = run(monkeypatch, [7, 7], clip=clip, vae=vae, audio_vae=MockAudioVae(),
+            refmods=mods, **refs)
+    plan_text = r.out[3]
+    # native: 1 image, 1 video, soundtrack + standalone audio -> RefMods continue from there
+    for line in ("<Picture 1> = ref_image_0", "<Audio 1> = ref_video_audio_0",
+                 "<Video 1> = ref_video_0", "<Audio 2> = ref_audio_0",
+                 "<Picture 2> = hero_face (RefMod)", "<Video 2> = hero_walk (RefMod)",
+                 "<Audio 3> = hero_voice (RefMod)"):
+        assert line in plan_text
+    native = ["image", "audio", "video", "audio"]
+    for seg_items in clip.items:
+        assert [i["type"] for i in seg_items] == native + ["image", "video", "audio"]
+        img, vid = seg_items[4], seg_items[5]
+        assert img["data"].shape[0] == 1 and img["data"].shape[-1] == 3
+        assert vid["timestamps"][0] == 0.0 and vid["data"].shape[0] == len(vid["timestamps"])
+    for c in r.st.calls:
+        blocks = c.meta["minimax_refs"]
+        assert [b["kind"] for b in blocks] == ["image", "video_audio", "audio",
+                                               "image", "video", "audio"]
+        assert [bool(b.get("refmod")) for b in blocks] == [False] * 3 + [True] * 3
+    # strength reached the block the model sees
+    assert torch.allclose(r.st.calls[0].meta["minimax_refs"][4]["latent"],
+                          mods[1][0].latent * 0.8)
+    v, a = r.out[0]["samples"].tensors
+    assert torch.equal(v, r.gt_v) and torch.equal(a, r.gt_a)
+
+
+def test_refmods_alone_use_the_reference_path(monkeypatch):
+    clip, vae = ItemClip(), DecodingVae()
+    mods = [(FakeRefMod("hero_face", "image"), 1.0)]
+    r = run(monkeypatch, [7, 7, 7], clip=clip, vae=vae, refmods=mods,
+            subject_definitions="<hero> comes from <Picture 1>.")
+    assert "<Picture 1> = hero_face (RefMod)" in r.out[3]
+    assert all([i["type"] for i in items] == ["image"] for items in clip.items)
+    assert all(len(c.meta["minimax_refs"]) == 1 for c in r.st.calls)
+    assert all(p.startswith("subject_definitions:") for p in clip.prompts), "r2v format"
+
+
+def test_refmods_are_decoded_once_per_run(monkeypatch):
+    vae = DecodingVae()
+    run(monkeypatch, [6, 6, 6, 6], vae=vae, refmods=mods_set())
+    assert vae.decodes == 2          # image + video; audio is never decoded
+
+
+def test_zero_strength_refmod_gets_no_label_or_block(monkeypatch):
+    clip = ItemClip()
+    mods = [(FakeRefMod("off", "image"), 0.0), (FakeRefMod("on", "image"), 1.0)]
+    r = run(monkeypatch, [7], clip=clip, vae=DecodingVae(), refmods=mods)
+    assert "<Picture 1> = on (RefMod)" in r.out[3] and "off" not in r.out[3].split("Segment")[0]
+    assert len(clip.items[0]) == 1 and len(r.st.calls[0].meta["minimax_refs"]) == 1
+
+
+def test_dry_run_lists_refmod_labels_without_decoding(monkeypatch):
+    vae = DecodingVae()
+    out = call_node(**node_kwargs([7, 7], dry_run=True, vae=vae, refmods=mods_set()))
+    assert "<Picture 1> = hero_face (RefMod)" in out[3] and vae.decodes == 0
+
+
+def test_refmods_cannot_combine_with_first_frame():
+    with pytest.raises(ValueError, match="RefMods"):
+        call_node(**node_kwargs([7, 7], vae=DecodingVae(), refmods=mods_set(),
+                                first_frame=torch.rand(1, H, W, 3)))
+
+
+def test_refmods_and_tail_guides_line_up_in_the_real_layout(monkeypatch):
+    """The model's own PackedLayout must accept keyframes + native refs + RefMods."""
+    refs = ref_set()
+    r = run(monkeypatch, [7, 7], vae=DecodingVae(), audio_vae=MockAudioVae(),
+            refmods=mods_set(), **refs)
+    seg = r.plan.segments[1]
+    meta = r.st.calls[1].meta
+    layout = PackedLayout(7, P.video_tokens(seg.window_frames), H // 16, W // 16,
+                          seg.window_audio_tokens, keyframes=meta["minimax_keyframes"],
+                          refs=meta["minimax_refs"])
+    kinds = [k for _a, _b, k in layout.segments]
+    assert kinds.count("ref_img") == 4          # native image + video, RefMod image + video
+    assert kinds.count("cond") == 1             # the continuation's video tail
+
+
+def test_unconnected_or_muted_refs_take_no_label(monkeypatch):
+    """A muted loader's link never reaches the node; slot names don't matter."""
+    img = torch.rand(1, H, W, 3)
+    r = run(monkeypatch, [7], vae=DecodingVae(), refmods=[(FakeRefMod("hero", "image"), 1.0)],
+            ref_images={"ref_image_0": None, "ref_image_5": img})
+    assert "<Picture 1> = ref_image_5" in r.out[3]
+    assert "<Picture 2> = hero (RefMod)" in r.out[3]

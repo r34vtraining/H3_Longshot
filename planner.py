@@ -326,7 +326,8 @@ def build_prompts(shots: list[dict], plan: Plan, bundle: dict, *, reference_mode
 # ---------------------------------------------------------------------------
 
 def render_plan(plan: Plan, prompts: list[SegmentPrompt], seeds: list[int] | None = None,
-                song_offset: float | None = None, include_prompts: bool = True) -> str:
+                song_offset: float | None = None, include_prompts: bool = True,
+                statuses: list[str] | None = None, own_seeds: list[bool] | None = None) -> str:
     """The plan as text. include_prompts=False gives the short console version:
     one line per segment plus warnings, without the prompt bodies."""
     total = seconds(plan.total_frames)
@@ -347,10 +348,14 @@ def render_plan(plan: Plan, prompts: list[SegmentPrompt], seeds: list[int] | Non
             head += f" ({s.overlap_frames}f hidden overlap)"
         if seeds is not None:
             head += f" · seed {seeds[s.index - 1]}"
+            if own_seeds and own_seeds[s.index - 1]:
+                head += " (Shot seed)"
         extras = [x for x, on in (("first frame", sp.first_frame),
                                   ("last frame", sp.last_frame)) if on]
         if extras:
             head += " · " + " + ".join(extras)
+        if statuses is not None:
+            head += f" · {statuses[s.index - 1]}"
         lines.append(head)
         if song_offset is not None:
             w0 = song_offset + seconds(s.window_start)

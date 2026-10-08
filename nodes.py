@@ -5,10 +5,13 @@ from __future__ import annotations
 
 import inspect
 import logging
+import math
+from collections import OrderedDict
 
 import torch
 
 from . import planner
+from . import store as disk
 
 logger = logging.getLogger("MiniMaxH3LongShot")
 
@@ -76,27 +79,148 @@ def _empty_window(width, height, seg, like=None):
     return {"samples": NestedTensor((video, audio))}
 
 
+# ---------------------------------------------------------------------------
+# RefMods, presented the way H3 RefMod Text Encode presents them
+# ---------------------------------------------------------------------------
+
+_LABEL_NAMES = {"image": "Picture", "video": "Video", "audio": "Audio"}
+REFMOD_FPS = 24.0   # saved RefMods carry no frame rate; H3 runs at 24
+
+
+def _active_refmods(refmods):
+    """(mod, strength) rows with strength > 0, in loader order."""
+    active = []
+    for mod, strength in refmods or []:
+        strength = float(strength)
+        if not 0.0 <= strength <= 1.0:
+            raise ValueError(f"RefMod '{getattr(mod, 'name', '?')}' has strength {strength}; "
+                             f"it must be between 0 and 1.")
+        if strength > 0:
+            active.append((mod, strength))
+    return active
+
+
+def _native_label_counts(refs):
+    """How many <Picture>/<Video>/<Audio> labels the native references take.
+    A video soundtrack only counts when its same-numbered video is connected."""
+    videos = refs["ref_videos"]
+    soundtracks = [n for n in refs["ref_video_audios"]
+                   if "ref_video_" + n.rsplit("_", 1)[-1] in videos]
+    return {"image": len(refs["ref_images"]), "video": len(videos),
+            "audio": len(soundtracks) + len(refs["ref_audios"])}
+
+
+def native_labels(refs):
+    """The label each live reference input gets, in the native node's order:
+    images, then each video (its soundtrack's <Audio> label first), then
+    standalone audio."""
+    out = [(f"<Picture {i}>", name) for i, name in enumerate(refs["ref_images"], 1)]
+    audio = 0
+    for v, name in enumerate(refs["ref_videos"], 1):
+        track = "ref_video_audio_" + name.rsplit("_", 1)[-1]
+        if track in refs["ref_video_audios"]:
+            audio += 1
+            out.append((f"<Audio {audio}>", track))
+        out.append((f"<Video {v}>", name))
+    for name in refs["ref_audios"]:
+        audio += 1
+        out.append((f"<Audio {audio}>", name))
+    return out
+
+
+def refmod_labels(refs, refmods):
+    """Each active RefMod's label, numbered after the native references."""
+    counts = _native_label_counts(refs)
+    labels = []
+    for mod, _strength in _active_refmods(refmods):
+        kind = mod.kind
+        if kind not in _LABEL_NAMES:
+            raise ValueError(f"RefMod '{mod.name}' has unknown kind {kind!r}.")
+        counts[kind] += 1
+        labels.append((f"<{_LABEL_NAMES[kind]} {counts[kind]}>", mod.name, kind))
+    return labels
+
+
+def _refmod_presentation(refmods, vae):
+    """Tokenizer items and model blocks for the active RefMods, in matching
+    order — the same thing H3 RefMod Text Encode builds. Visual RefMods are
+    decoded from the same (strength-weakened) latent the model receives, so
+    the text encoder sees exactly what the model attends to."""
+    items, blocks = [], []
+    for mod, strength in _active_refmods(refmods):
+        block = mod.ref_block(strength)
+        if block is None:
+            continue
+        block["refmod"] = True          # lets H3 RefMod Step Curve find it
+        kind = block["kind"]
+        item = {"type": kind}
+        if kind != "audio":
+            if vae is None:
+                raise ValueError("Visual RefMods need the H3 video VAE connected.")
+            pixels = vae.decode(block["latent"])
+            if pixels.ndim == 5 and pixels.shape[0] == 1:
+                pixels = pixels[0]
+            if pixels.ndim != 4 or pixels.shape[-1] != 3 or pixels.shape[0] < 1:
+                raise ValueError(f"RefMod '{mod.name}' decoded to an unexpected shape "
+                                 f"{tuple(pixels.shape)}.")
+            if kind == "image":
+                item["data"] = pixels[:1].cpu().clone()
+            else:
+                # the text encoder sees video at 2 fps, as the native node presents it
+                times = [i / 2 for i in range(math.ceil(pixels.shape[0] * 2 / REFMOD_FPS))]
+                idx = [min(round(t * REFMOD_FPS), pixels.shape[0] - 1) for t in times]
+                item["data"] = pixels[idx].cpu()
+                item["timestamps"] = times
+            del pixels
+        items.append(item)
+        blocks.append(block)
+    return items, blocks
+
+
+class _PresentingClip:
+    """The real CLIP, with extra reference items appended to every tokenize.
+
+    The native Reference to Video node presents its own references to the text
+    encoder; this adds the RefMods after them in the same call, so the native
+    node keeps doing everything else exactly as it does natively."""
+
+    def __init__(self, clip, extra_items):
+        self._clip = clip
+        self._extra = list(extra_items)
+
+    def tokenize(self, text, *args, minimax_ref_items=None, **kwargs):
+        items = list(minimax_ref_items or []) + self._extra
+        return self._clip.tokenize(text, *args, minimax_ref_items=items, **kwargs)
+
+    def __getattr__(self, name):
+        return getattr(self._clip, name)
+
+
 class _RefEncoder:
     """Per-segment conditioning through ComfyUI's own H3 nodes.
 
     References go to the native Reference to Video node exactly as connected,
     so <Picture N> / <Video N> / <Audio N> numbering matches the native node.
+    RefMods are presented right after them, taking the next labels.
 
     The text encoder has to run per segment (each has its own prompt), but the
     VAE encodes of the references don't: they depend only on the references and
     the window length. Those blocks are encoded once per window length and
-    reused, which saves re-encoding every reference video on every segment."""
+    reused, which saves re-encoding every reference video on every segment.
+    RefMods are decoded for the text encoder once for the whole run."""
 
-    def __init__(self, clip, vae, audio_vae, width, height, refs, ref_image_size):
+    def __init__(self, clip, vae, audio_vae, width, height, refs, ref_image_size, refmods=None):
         self.clip, self.vae, self.audio_vae = clip, vae, audio_vae
         self.width, self.height = width, height
         self.refs = refs
         self.ref_image_size = ref_image_size
-        self._blocks = {}   # window_frames -> minimax_refs blocks
+        self._blocks = {}   # window_frames -> native minimax_refs blocks
+        self._mod_items, self._mod_blocks = (_refmod_presentation(refmods, vae)
+                                             if refmods else ([], []))
 
     @property
     def has_refs(self):
-        return any(self.refs.values())
+        return any(self.refs.values()) or bool(self._mod_blocks)
 
     def encode(self, prompt, frames, first_frame=None, last_frame=None):
         h3, _ = _native()
@@ -106,19 +230,20 @@ class _RefEncoder:
                 first_frame=first_frame, last_frame=last_frame)
             return _unwrap(out)[0]
 
+        import node_helpers
+        clip = _PresentingClip(self.clip, self._mod_items) if self._mod_items else self.clip
         cached = self._blocks.get(frames)
         out = h3.MiniMaxH3ReferenceToVideo.execute(
-            self.clip, prompt, self.width, self.height, frames,
+            clip, prompt, self.width, self.height, frames,
             ref_image_size=self.ref_image_size,
             vae=None if cached is not None else self.vae,
             audio_vae=None if cached is not None else self.audio_vae,
             **self.refs)
         positive = _unwrap(out)[0]
         if cached is None:
-            self._blocks[frames] = list(positive[0][1].get("minimax_refs", []) or [])
-            return positive
-        import node_helpers
-        return node_helpers.conditioning_set_values(positive, {"minimax_refs": list(cached)})
+            cached = self._blocks[frames] = list(positive[0][1].get("minimax_refs", []) or [])
+        return node_helpers.conditioning_set_values(
+            positive, {"minimax_refs": list(cached) + list(self._mod_blocks)})
 
 
 def _song_slice(song, seg):
@@ -198,13 +323,237 @@ def _sample_window(model, noise, sampler, sigmas, positive, latent):
     return _unwrap(cs.SamplerCustomAdvanced.execute(noise, guider, sampler, sigmas, latent))[0]
 
 
-def _segment_noise(noise, seed_mode, index):
-    """Only RandomNoise is stepped — stepping DisableNoise's seed would
-    silently turn it into real noise."""
-    _, cs = _native()
-    if seed_mode == "increment" and isinstance(noise, cs.Noise_RandomNoise):
-        return cs.Noise_RandomNoise(noise.seed + index - 1)
-    return noise
+def _is_reseedable(noise):
+    """Any noise source that draws from a seed — ComfyUI's RandomNoise or a
+    custom-node equivalent. DisableNoise (Noise_EmptyNoise) also carries a
+    seed attribute but ignores it; re-seeding it is pointless, so it's left
+    alone."""
+    if noise is None or type(noise).__name__ == "Noise_EmptyNoise":
+        return False
+    seed = getattr(noise, "seed", None)
+    return isinstance(seed, int) and not isinstance(seed, bool) and callable(
+        getattr(noise, "generate_noise", None))
+
+
+def segment_seeds(noise, seed_mode, shots):
+    """Each segment's seed, and whether it came from the Shot's own seed.
+
+    A Shot seed of -1 follows Long Shot: base + N - 1 with 'increment', base
+    with 'same'. Noise that doesn't draw from a seed (DisableNoise) keeps its
+    own and ignores Shot seeds."""
+    base = getattr(noise, "seed", None)
+    reseed = _is_reseedable(noise)
+    seeds, own = [], []
+    for i, shot in enumerate(shots, 1):
+        shot_seed = int(shot.get("seed", -1) if shot.get("seed") is not None else -1)
+        if reseed and shot_seed >= 0:
+            seeds.append(shot_seed)
+            own.append(True)
+        elif reseed and seed_mode == "increment":
+            seeds.append(base + i - 1)
+            own.append(False)
+        else:
+            seeds.append(base)
+            own.append(False)
+    return seeds, own
+
+
+def _segment_noise(noise, seed):
+    """A copy of the noise source drawing from this segment's seed. Copying
+    keeps whatever else a custom noise node carries."""
+    if not _is_reseedable(noise) or noise.seed == seed:
+        return noise
+    import copy
+    out = copy.copy(noise)
+    out.seed = seed
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Segment reuse
+#
+# Segment N's result depends only on its own inputs and on segments 1..N-1, so
+# each finished segment is remembered under a fingerprint of exactly that: its
+# own inputs plus the previous segment's fingerprint. Nothing about later
+# segments goes in, so adding a Shot to the end keeps every earlier segment.
+# ---------------------------------------------------------------------------
+
+_SEGMENT_CACHE = OrderedDict()   # fingerprint -> sampled window (on CPU)
+SEGMENT_CACHE_MAX = 64
+_LAST_RUN = []                   # per segment: {component: digest} of the last real run
+
+# Checked in this order when explaining why a segment renders.
+_REASONS = (("model", "model, CLIP or VAE changed"),
+            ("sampler", "sampler, sigmas or size changed"),
+            ("prompt", "prompt changed"),
+            ("seed", "seed changed"),
+            ("length", "length changed"),
+            ("references", "references changed"),
+            ("song", "song changed"),
+            ("frames", "first/last frame changed"))
+
+
+_FULL_HASH_ELEMENTS = 16 * 1024 * 1024
+
+
+def _digest(obj, _depth=0):
+    """A stable hash of tensors, containers and plain values. Anything else
+    hashes by identity, which is what makes a reloaded model a change."""
+    import hashlib
+    h = hashlib.blake2b(digest_size=16)
+
+    def feed(o, depth):
+        if isinstance(o, torch.Tensor):
+            t = o.detach()
+            h.update(f"T{t.dtype}{tuple(t.shape)}".encode())
+            if t.numel() > _FULL_HASH_ELEMENTS:
+                # A long reference video can be gigabytes; hash an even spread of
+                # it plus its exact sum instead of every byte.
+                flat = t.reshape(-1)
+                step = flat.numel() // _FULL_HASH_ELEMENTS + 1
+                h.update(repr(float(flat.double().sum())).encode())
+                t = flat[::step]
+            t = t.contiguous().cpu()
+            h.update(t.view(torch.uint8).numpy().tobytes() if t.numel() else b"")
+        elif hasattr(o, "tensors") and isinstance(getattr(o, "tensors"), (list, tuple)):
+            h.update(b"N")
+            for t in o.tensors:
+                feed(t, depth)
+        elif isinstance(o, dict):
+            h.update(b"{")
+            for k in sorted(o, key=str):
+                h.update(repr(k).encode())
+                feed(o[k], depth)
+            h.update(b"}")
+        elif isinstance(o, (list, tuple)):
+            h.update(b"[")
+            for x in o:
+                feed(x, depth)
+            h.update(b"]")
+        elif o is None or isinstance(o, (bool, int, float, str, bytes)):
+            h.update(repr(o).encode())
+        elif callable(o) and hasattr(o, "__qualname__"):
+            h.update(f"F{getattr(o, '__module__', '')}.{o.__qualname__}".encode())
+        elif depth < 2 and hasattr(o, "__dict__"):
+            h.update(f"O{type(o).__qualname__}".encode())
+            feed({k: v for k, v in vars(o).items() if not k.startswith("_")}, depth + 1)
+        else:
+            h.update(f"I{type(o).__qualname__}:{id(o)}".encode())
+
+    feed(obj, _depth)
+    return h.hexdigest()
+
+
+def _identity(obj):
+    """Who an object is, not what it holds: a new LoRA or a reloaded model is a
+    new object, and patches_uuid changes when a patcher is re-patched."""
+    if obj is None:
+        return None
+    patcher = getattr(obj, "patcher", obj)
+    return (type(obj).__qualname__, id(obj), str(getattr(patcher, "patches_uuid", "")))
+
+
+def _mods_digest(refmods):
+    return [(getattr(m, "name", "?"), getattr(m, "kind", "?"), float(st),
+             _digest(getattr(m, "latent", None)))
+            for m, st in (refmods or [])]
+
+
+def shared_components(*, model, clip, vae, audio_vae, sampler, sigmas, width, height,
+                      refs, ref_image_size, refmods, extra_blocks, first_frame, last_frame,
+                      recipe=None):
+    """The parts every segment shares, hashed once per run.
+
+    With a recipe (the run came through ComfyUI's executor), the model and
+    sampler are identified by how they were built, which survives restarts
+    and lets segments be saved to disk. Without one, by object identity."""
+    if recipe is not None:
+        model_part = _digest(["recipe", recipe["model"]])
+        sampler_part = _digest(["recipe", recipe["sampler"], width, height])
+    else:
+        model_part = _digest([_identity(model), _identity(clip), _identity(vae),
+                              _identity(audio_vae)])
+        sampler_part = _digest([sampler, sigmas, width, height])
+    return {
+        "model": model_part,
+        "sampler": sampler_part,
+        "references": _digest([refs, ref_image_size, _mods_digest(refmods), extra_blocks]),
+        "first": _digest(first_frame),
+        "last": _digest(last_frame),
+    }
+
+
+def segment_components(sp, seed, noise, shared, song):
+    """Everything that decides one segment's result, apart from the segments
+    before it."""
+    seg = sp.segment
+    return {
+        "model": shared["model"],
+        "sampler": shared["sampler"],
+        "prompt": _digest(sp.prompt),
+        "seed": _digest([type(noise).__qualname__, seed]),
+        "length": _digest([seg.window_start, seg.window_frames, seg.overlap_frames,
+                           seg.new_frames]),
+        "references": shared["references"],
+        "song": _digest(_song_slice(song, seg) if song is not None else None),
+        "frames": _digest([shared["first"] if sp.first_frame else None,
+                           shared["last"] if sp.last_frame else None]),
+    }
+
+
+def chain_fingerprints(components):
+    fps, prev = [], ""
+    for comp in components:
+        prev = _digest([prev, [comp[k] for k, _ in _REASONS]])
+        fps.append(prev)
+    return fps
+
+
+def segment_statuses(components, fingerprints, reuse, store=None):
+    """'reused (memory)', 'reused (disk)' or 'will render — <why>' per segment."""
+    out = []
+    for i, (comp, fp) in enumerate(zip(components, fingerprints)):
+        if reuse and fp in _SEGMENT_CACHE:
+            out.append("reused (memory)")
+            continue
+        if reuse and store is not None and store.has(fp):
+            out.append("reused (disk)")
+            continue
+        if not reuse:
+            why = "reuse off"
+        elif i >= len(_LAST_RUN):
+            why = "first run" if not _LAST_RUN else "new segment"
+        else:
+            changed = [label for key, label in _REASONS if comp[key] != _LAST_RUN[i][key]]
+            why = changed[0] if changed else (
+                "follows a changed segment" if i else "not in memory")
+        out.append(f"will render — {why}")
+    return out
+
+
+def _remember(fp, sampled):
+    from comfy.nested_tensor import NestedTensor
+    v, a = sampled["samples"].tensors
+    _SEGMENT_CACHE[fp] = {"samples": NestedTensor((v.detach().cpu().clone(),
+                                                   a.detach().cpu().clone()))}
+    _SEGMENT_CACHE.move_to_end(fp)
+    while len(_SEGMENT_CACHE) > SEGMENT_CACHE_MAX:
+        _SEGMENT_CACHE.popitem(last=False)
+
+
+def _recall(fp):
+    from comfy.nested_tensor import NestedTensor
+    hit = _SEGMENT_CACHE.get(fp)
+    if hit is None:
+        return None
+    _SEGMENT_CACHE.move_to_end(fp)
+    v, a = hit["samples"].tensors
+    return {"samples": NestedTensor((v.clone(), a.clone()))}
+
+
+def clear_segment_cache():
+    _SEGMENT_CACHE.clear()
+    _LAST_RUN.clear()
 
 
 def _append(cumulative, sampled, seg):
@@ -312,11 +661,69 @@ def _ref_inputs(io):
     ]
 
 
-def run_long_shot(model, clip, vae, noise, sampler, sigmas, prompt, width, height,
-                  overlap_frames, seed_mode, dry_run, ref_image_size="match", audio_vae=None,
-                  song=None, first_frame=None, last_frame=None, extra_refs=None,
-                  ref_images=None, ref_videos=None, ref_video_audios=None, ref_audios=None):
+# ---------------------------------------------------------------------------
+# Front-end hooks: per-segment progress over the websocket and a
+# machine-readable plan, for H3 Long Shot Studio and anything else that wants
+# them. Both are best-effort and never affect the render.
+# ---------------------------------------------------------------------------
+
+PROGRESS_EVENT = "mmh3.longshot"
+
+
+def _notify(payload):
+    """Send one progress event to the client that queued the prompt."""
+    try:
+        from server import PromptServer
+        server = getattr(PromptServer, "instance", None)
+        if server is not None:
+            server.send_sync(PROGRESS_EVENT, payload, getattr(server, "client_id", None))
+    except Exception:   # no server (tests, scripts) or a closed socket
+        pass
+
+
+def plan_rows(plan, seeds, own_seeds, statuses, show_seeds=True):
+    """The plan as data: one dict per segment, for front ends that would
+    otherwise have to parse the text plan."""
+    rows = []
+    for s, seed, own, status in zip(plan.segments, seeds, own_seeds, statuses):
+        reused = status.startswith("reused")
+        rows.append({
+            "index": s.index,
+            "requested_seconds": s.requested_seconds,
+            "seconds": round(planner.seconds(s.new_frames), 4),
+            "start": round(planner.seconds(s.visible_start), 4),
+            "end": round(planner.seconds(s.visible_end), 4),
+            "frames": s.new_frames,
+            "start_frame": s.visible_start,
+            "window_frames": s.window_frames,
+            "seed": seed if show_seeds else None,
+            "own_seed": bool(own),
+            "status": "reused" if reused else "render",
+            "source": status[len("reused ("):-1] if reused else None,
+            "reason": None if reused else status.split("— ", 1)[-1],
+        })
+    return rows
+
+
+def run_long_shot(*args, **kwargs):
     """The whole Long Shot run. Returns (latent, total_frames, total_seconds, plan)."""
+    return _run_long_shot(*args, **kwargs)[0]
+
+
+STORE_ROOT = None          # None: <ComfyUI output>/longshot (tests point it elsewhere)
+LAZY_INPUTS = ("model", "clip", "vae", "sigmas", "audio_vae")
+
+
+def _prepare(model, clip, vae, noise, sampler, sigmas, prompt, width, height,
+             overlap_frames, seed_mode, dry_run=False, reuse_segments=True,
+             ref_image_size="match", audio_vae=None,
+             song=None, first_frame=None, last_frame=None, extra_refs=None, refmods=None,
+             ref_images=None, ref_videos=None, ref_video_audios=None, ref_audios=None,
+             save_to_disk=True, cache_name="default", _recipe=None, _planning_only=False):
+    """Everything up to sampling: checks, plan, prompts, seeds, fingerprints and
+    what each segment will do. Shared by the run and by the lazy-input check,
+    so both see exactly the same fingerprints."""
+    from types import SimpleNamespace
     if width % 32 or height % 32:
         raise ValueError("width and height must be multiples of 32")
     bundle = prompt or {}
@@ -333,11 +740,13 @@ def run_long_shot(model, clip, vae, noise, sampler, sigmas, prompt, width, heigh
         "ref_audios": {k: v for k, v in (ref_audios or {}).items() if v is not None},
     }
     native_refs = any(refs.values())
-    if native_refs and (first_frame is not None or last_frame is not None):
+    labels = refmod_labels(refs, refmods)
+    if (native_refs or labels) and (first_frame is not None or last_frame is not None):
         raise ValueError(
             "first_frame / last_frame use H3's image-to-video path and can't be combined "
-            "with reference inputs. Connect one or the other.")
-    if (refs["ref_audios"] or refs["ref_video_audios"]) and audio_vae is None:
+            "with reference inputs or RefMods. Connect one or the other.")
+    if (refs["ref_audios"] or refs["ref_video_audios"]) and audio_vae is None \
+            and not _planning_only:
         raise ValueError("Reference audio is connected — connect the H3 audio VAE to audio_vae.")
     for name in refs["ref_video_audios"]:
         if "ref_video_" + name.rsplit("_", 1)[-1] not in refs["ref_videos"]:
@@ -355,45 +764,137 @@ def run_long_shot(model, clip, vae, noise, sampler, sigmas, prompt, width, heigh
                 f"{planner.seconds(plan.total_frames):.2f}s. Shorten the shots or give Song "
                 f"Track a longer duration.")
 
-    extra_blocks = _extra_ref_blocks(extra_refs)
+    extra_blocks = _extra_ref_blocks(extra_refs) if not _planning_only else \
+        [b for e in (extra_refs or []) for b in (e[1].get("minimax_refs", []) or [])]
+    if labels and any(b.get("refmod") for b in extra_blocks) and not _planning_only:
+        logger.warning(
+            "MiniMax H3 Long Shot: RefMods are connected to both refmods and extra_refs. If "
+            "they're the same RefMods, they go in twice — use one or the other.")
     prompts = planner.build_prompts(
-        shots, plan, bundle, reference_mode=native_refs or bool(extra_blocks),
+        shots, plan, bundle, reference_mode=native_refs or bool(labels) or bool(extra_blocks),
         audio_reuse=song is not None,
         use_first_frame=first_frame is not None, use_last_frame=last_frame is not None)
-    seeds = None
-    if hasattr(noise, "seed"):
-        step = 1 if seed_mode == "increment" else 0
-        seeds = [noise.seed + step * (s.index - 1) for s in plan.segments]
-    report = planner.render_plan(plan, prompts, seeds,
-                                 song_offset=song["offset"] if song is not None else None)
+    seeds, own_seeds = segment_seeds(noise, seed_mode, shots)
+    shared = shared_components(
+        model=model, clip=clip, vae=vae, audio_vae=audio_vae, sampler=sampler,
+        sigmas=sigmas, width=width, height=height, refs=refs, ref_image_size=ref_image_size,
+        refmods=refmods, extra_blocks=extra_blocks, first_frame=first_frame,
+        last_frame=last_frame, recipe=_recipe)
+    components = [segment_components(sp, seeds[i], noise, shared, song)
+                  for i, sp in enumerate(prompts)]
+    fingerprints = chain_fingerprints(components)
+    # Disk needs a restart-stable fingerprint, so only with a recipe.
+    seg_store = (disk.SegmentStore(cache_name, STORE_ROOT)
+                 if reuse_segments and save_to_disk and _recipe is not None else None)
+    statuses = segment_statuses(components, fingerprints, reuse_segments, seg_store)
+    return SimpleNamespace(plan=plan, prompts=prompts, seeds=seeds, own_seeds=own_seeds,
+                           components=components, fingerprints=fingerprints,
+                           statuses=statuses, store=seg_store, refs=refs, labels=labels,
+                           extra_blocks=extra_blocks, bundle=bundle)
+
+
+def _window_shapes(seg, width, height):
+    video = (1, VIDEO_CHANNELS, planner.video_tokens(seg.window_frames), height // 16, width // 16)
+    audio = (1, AUDIO_CHANNELS, AUDIO_STEREO, seg.window_audio_tokens)
+    return video, audio
+
+
+def _run_long_shot(model, clip, vae, noise, sampler, sigmas, prompt, width, height,
+                   overlap_frames, seed_mode, dry_run, reuse_segments=True,
+                   ref_image_size="match", audio_vae=None,
+                   song=None, first_frame=None, last_frame=None, extra_refs=None, refmods=None,
+                   ref_images=None, ref_videos=None, ref_video_audios=None, ref_audios=None,
+                   save_to_disk=True, cache_name="default", _recipe=None):
+    """The run, plus the plan as data: ((latent, total_frames, total_seconds, plan), rows)."""
+    p = _prepare(model, clip, vae, noise, sampler, sigmas, prompt, width, height,
+                 overlap_frames, seed_mode, dry_run, reuse_segments, ref_image_size, audio_vae,
+                 song, first_frame, last_frame, extra_refs, refmods, ref_images, ref_videos,
+                 ref_video_audios, ref_audios, save_to_disk, cache_name, _recipe)
+    plan, prompts, seeds, own_seeds = p.plan, p.prompts, p.seeds, p.own_seeds
+    components, fingerprints, statuses = p.components, p.fingerprints, p.statuses
+    refs, labels, extra_blocks, seg_store = p.refs, p.labels, p.extra_blocks, p.store
+    if reuse_segments and save_to_disk and _recipe is None:
+        logger.info("MiniMax H3 Long Shot: no workflow recipe for this run (called outside "
+                    "ComfyUI's executor), so segments stay in memory only")
+
+    show_seeds = seeds if getattr(noise, "seed", None) is not None else None
+    label_text = ""
+    live = native_labels(refs)
+    if live or labels:
+        rows = [f"  {label} = {name}" for label, name in live]
+        rows += [f"  {label} = {name} (RefMod)" for label, name, _kind in labels]
+        label_text = ("Reference labels — use these in your subject definitions:\n"
+                      + "\n".join(rows) + "\n\n")
+    plan_args = dict(song_offset=song["offset"] if song is not None else None,
+                     statuses=statuses, own_seeds=own_seeds)
+    report = label_text + planner.render_plan(plan, prompts, show_seeds, **plan_args)
+    if seg_store is not None:
+        report += f"\nSaved segments: {seg_store.folder}"
     # Console gets the short version; the full plan, prompts included, is the
     # plan output, for a text preview node.
-    logger.info("\n%s", planner.render_plan(
-        plan, prompts, seeds, song_offset=song["offset"] if song is not None else None,
-        include_prompts=False))
+    logger.info("\n%s%s", label_text, planner.render_plan(
+        plan, prompts, show_seeds, include_prompts=False, **plan_args))
     total_s = planner.seconds(plan.total_frames)
+    rows = plan_rows(plan, seeds, own_seeds, statuses, show_seeds is not None)
 
     if dry_run:
         # Block the latent so nothing downstream of it runs — no decode, no saved
         # clip — while plan, total_frames and total_seconds still go through.
         from comfy_execution.graph_utils import ExecutionBlocker
-        return (ExecutionBlocker(None), plan.total_frames, total_s, report)
+        return (ExecutionBlocker(None), plan.total_frames, total_s, report), rows
 
     _native()
     _require_arbitrary_guides()
     import comfy.model_management
+    from comfy.nested_tensor import NestedTensor
 
-    encoder = _RefEncoder(clip, vae, audio_vae, width, height, refs, ref_image_size)
     if extra_blocks:
         logger.info("MiniMax H3 Long Shot: adding %d external reference block(s) to every "
                     "segment", len(extra_blocks))
+    if seg_store is not None:
+        seg_store.clean_tmp()
+    _LAST_RUN[:] = components
+    encoder = None       # built on the first segment that actually renders
 
     cumulative = None
-    for sp in prompts:
+    of = len(prompts)
+
+    def progress(seg, status, source=None):
+        event = {"segment": seg.index, "of": of, "status": status,
+                 "seed": seeds[seg.index - 1] if show_seeds is not None else None,
+                 "seconds": round(planner.seconds(seg.new_frames), 4)}
+        if source:
+            event["source"] = source
+        _notify(event)
+
+    for i, sp in enumerate(prompts):
         seg = sp.segment
+        fp = fingerprints[i]
         comfy.model_management.throw_exception_if_processing_interrupted()
-        logger.info("MiniMax H3 Long Shot: segment %d/%d, %d-frame window",
-                    seg.index, len(prompts), seg.window_frames)
+        sampled, source = (_recall(fp) if reuse_segments else None), "memory"
+        if sampled is None and seg_store is not None:
+            vshape, ashape = _window_shapes(seg, width, height)
+            loaded = seg_store.load(fp, vshape, ashape)
+            if loaded is not None:
+                sampled, source = {"samples": NestedTensor(loaded)}, "disk"
+                _remember(fp, sampled)
+        if sampled is not None:
+            logger.info("MiniMax H3 Long Shot: segment %d/%d reused from %s", seg.index,
+                        len(prompts), source)
+            progress(seg, "reused", source)
+            cumulative = (sampled if cumulative is None else _append(cumulative, sampled, seg))
+            continue
+        if clip is None or vae is None:      # lazy inputs skipped by the plan
+            raise RuntimeError(
+                f"Segment {seg.index} has to render, but the model wasn't loaded because the "
+                f"plan expected to reuse it (a saved segment may have been deleted while the "
+                f"run started). Queue again.")
+        progress(seg, "rendering")
+        logger.info("MiniMax H3 Long Shot: segment %d/%d, %d-frame window, seed %s",
+                    seg.index, len(prompts), seg.window_frames, seeds[i])
+        if encoder is None:
+            encoder = _RefEncoder(clip, vae, audio_vae, width, height, refs, ref_image_size,
+                                  refmods)
 
         positive = encoder.encode(sp.prompt, seg.window_frames,
                                   first_frame if sp.first_frame else None,
@@ -409,12 +910,23 @@ def run_long_shot(model, clip, vae, noise, sampler, sigmas, prompt, width, heigh
         target = _empty_window(width, height, seg,
                                like=None if cumulative is None
                                else cumulative["samples"].tensors[0])
-        sampled = _sample_window(model, _segment_noise(noise, seed_mode, seg.index),
+        sampled = _sample_window(model, _segment_noise(noise, seeds[i]),
                                  sampler, sigmas, positive, target)
+        if reuse_segments:
+            _remember(fp, sampled)
+        if seg_store is not None:
+            v_s, a_s = sampled["samples"].tensors
+            try:
+                seg_store.save(fp, v_s, a_s, {"segment": seg.index, "of": of,
+                                              "seconds": round(planner.seconds(seg.new_frames), 4),
+                                              "seed": seeds[i]})
+            except Exception as err:   # a full disk mustn't cost the render
+                logger.warning("MiniMax H3 Long Shot: couldn't save segment %d to disk: %s",
+                               seg.index, err)
         cumulative = ({"samples": sampled["samples"]} if cumulative is None
                       else _append(cumulative, sampled, seg))
+        progress(seg, "done")
 
-    from comfy.nested_tensor import NestedTensor
     v, a = cumulative["samples"].tensors
     if v.shape[2] != plan.total_video_tokens or a.shape[-1] != plan.total_audio_tokens:
         raise RuntimeError(
@@ -424,7 +936,46 @@ def run_long_shot(model, clip, vae, noise, sampler, sigmas, prompt, width, heigh
         # The song is the source of truth: output it exactly.
         a = song["latent"][..., :plan.total_audio_tokens].to(a)
         cumulative = {"samples": NestedTensor((v, a))}
-    return (cumulative, plan.total_frames, total_s, report)
+    return (cumulative, plan.total_frames, total_s, report), rows
+
+
+def _plain(value):
+    """Lazy checks may hand dynamic inputs over as (value, key) pairs; unwrap them."""
+    if isinstance(value, dict):
+        return {k: _plain(v) for k, v in value.items()}
+    if isinstance(value, tuple) and len(value) == 2 and isinstance(value[1], str):
+        return value[0]
+    return value
+
+
+def lazy_requests(kwargs, prompt, unique_id):
+    """Which lazy inputs Long Shot needs. Model, CLIP, VAEs and sigmas are only
+    worth loading when a segment will actually sample: a dry run, or a run
+    where every segment comes from memory or disk, needs none of them."""
+    linked = disk.linked_inputs(prompt, unique_id)
+    if linked is None:      # no prompt: request the required ones, as before
+        return [n for n in ("model", "clip", "vae", "sigmas") if kwargs.get(n) is None]
+    wanted = [n for n in LAZY_INPUTS if n in linked and kwargs.get(n) is None]
+    if not wanted or kwargs.get("dry_run"):
+        return []
+    recipe = disk.recipe_components(prompt, unique_id)
+    if recipe is None or not kwargs.get("reuse_segments", True):
+        return wanted
+    args = {k: _plain(v) for k, v in kwargs.items()}
+    try:
+        p = _prepare(**args, _recipe=recipe, _planning_only=True)
+    except Exception:       # let the run itself report the problem
+        return wanted
+    return [] if all(s.startswith("reused") for s in p.statuses) else wanted
+
+
+def _schema_extras(io):
+    """Schema flags newer ComfyUI builds understand. has_intermediate_output
+    makes ComfyUI resend the plan UI when the whole run comes from its cache,
+    so front ends reading /history still get the plan. Older builds don't know
+    the flag, so it's only passed where it exists."""
+    fields = getattr(io.Schema, "__dataclass_fields__", {})
+    return {"has_intermediate_output": True} if "has_intermediate_output" in fields else {}
 
 
 def _make_long_shot_node():
@@ -443,12 +994,14 @@ def _make_long_shot_node():
                 description="One continuous shot from a chain of Shot nodes: one H3 generation "
                             "per Shot, stitched in latent space so a single decode is seamless.",
                 inputs=[
-                    io.Model.Input("model"),
-                    io.Clip.Input("clip"),
-                    io.Vae.Input("vae", tooltip="H3 video VAE."),
+                    io.Model.Input("model", lazy=True,
+                                   tooltip="Only loaded when a segment has to render: a dry run "
+                                   "or a fully reused run never loads the model."),
+                    io.Clip.Input("clip", lazy=True),
+                    io.Vae.Input("vae", lazy=True, tooltip="H3 video VAE."),
                     io.Noise.Input("noise"),
                     io.Sampler.Input("sampler"),
-                    io.Sigmas.Input("sigmas"),
+                    io.Sigmas.Input("sigmas", lazy=True),
                     io.Custom("MMH3_LONGSHOT").Input(
                         "prompt", tooltip="The long_shot output of MiniMax H3 Ref Prompt Builder "
                         "r2v, with a Shot chain wired into its 'shots' input. Each Shot is one "
@@ -467,10 +1020,25 @@ def _make_long_shot_node():
                                      tooltip="Output the plan and every segment's prompt without "
                                      "sampling. The latent is blocked, so everything wired after "
                                      "it (decoders, video save) is skipped."),
+                    io.Boolean.Input("reuse_segments", default=True,
+                                     tooltip="Remember finished segments and reuse any that "
+                                     "would come out identical, so only Shots you changed — "
+                                     "and the ones after them — render again. Kept in memory "
+                                     "until ComfyUI restarts. The plan shows which segments "
+                                     "will be reused."),
                     io.Combo.Input("ref_image_size", options=["match", "max"], default="match",
                                    tooltip="'max' holds identity better but is slower — paid on "
                                    "every segment."),
-                    io.Vae.Input("audio_vae", optional=True,
+                    # New widgets go last, so saved workflows keep their values.
+                    io.Boolean.Input("save_to_disk", default=True, optional=True,
+                                     tooltip="Also save each finished segment to "
+                                     "output/longshot/<cache_name>/segments, so a crash or "
+                                     "restart doesn't cost finished Shots. Needs reuse_segments."),
+                    io.String.Input("cache_name", default="default", optional=True,
+                                    tooltip="Folder name for this project's saved segments "
+                                    "(letters, digits, . _ -). H3 Long Shot Studio sets it to "
+                                    "the project."),
+                    io.Vae.Input("audio_vae", optional=True, lazy=True,
                                  tooltip="H3 audio VAE. Needed only when reference audio or video "
                                  "soundtracks are connected."),
                     io.Custom("MMH3_SONG").Input(
@@ -482,11 +1050,16 @@ def _make_long_shot_node():
                     io.Image.Input("last_frame", optional=True,
                                    tooltip="Closing frame for the final segment. Can't be "
                                    "combined with reference inputs."),
+                    io.Custom("H3_REF_MODS").Input(
+                        "refmods", optional=True, tooltip="From Load H3 RefMods. Each RefMod is "
+                        "shown to the text encoder under the next free label after your "
+                        "reference inputs — the plan lists them — so your subject definitions "
+                        "can point at it. Don't also apply the same RefMods through extra_refs."),
                     io.Conditioning.Input(
-                        "extra_refs", optional=True, tooltip="Reference blocks added by another "
-                        "node, e.g. Apply H3 RefMod. Feed it a conditioning (a native Reference "
-                        "to Video with an empty prompt works); its reference blocks are added to "
-                        "every segment and its prompt text is ignored."),
+                        "extra_refs", optional=True, tooltip="Reference blocks only, e.g. from "
+                        "MiniMax H3 RefMod Carrier → Apply H3 RefMod, for Apply's retention and "
+                        "curve controls. These get no label in the prompt; use refmods for "
+                        "RefMods your prompt refers to."),
                 ] + _ref_inputs(io),
                 outputs=[
                     io.Latent.Output(display_name="latent"),
@@ -494,11 +1067,26 @@ def _make_long_shot_node():
                     io.Float.Output(display_name="total_seconds"),
                     io.String.Output(display_name="plan"),
                 ],
+                hidden=[io.Hidden.prompt, io.Hidden.unique_id],
+                **_schema_extras(io),
             )
 
         @classmethod
+        def _hidden(cls):
+            h = getattr(cls, "hidden", None)
+            return getattr(h, "prompt", None), getattr(h, "unique_id", None)
+
+        @classmethod
+        def check_lazy_status(cls, **kwargs):
+            return lazy_requests(kwargs, *cls._hidden())
+
+        @classmethod
         def execute(cls, **kwargs) -> io.NodeOutput:
-            return io.NodeOutput(*run_long_shot(**kwargs))
+            recipe = disk.recipe_components(*cls._hidden())
+            outputs, rows = _run_long_shot(**kwargs, _recipe=recipe)
+            # The plan also goes out as a UI output, so /history carries it
+            # (dry run included) for front ends like H3 Long Shot Studio.
+            return io.NodeOutput(*outputs, ui={"text": [outputs[3]], "plan_json": rows})
 
     return MiniMaxH3LongShot
 
