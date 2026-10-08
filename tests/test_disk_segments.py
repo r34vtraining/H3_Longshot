@@ -236,11 +236,11 @@ def test_no_recipe_means_memory_only(monkeypatch):
 
 
 def test_each_project_has_its_own_folder(monkeypatch):
-    run(monkeypatch, [5], cache_name="mara-spaceport-chase")
+    run(monkeypatch, [5], cache_name="sample-project")
     nodes.clear_segment_cache()
     run(monkeypatch, [5], cache_name="../../escape me")
     root = nodes.STORE_ROOT
-    assert sorted(os.listdir(root)) == ["escape_me", "mara-spaceport-chase"]
+    assert sorted(os.listdir(root)) == ["escape_me", "sample-project"]
 
 
 def test_a_changed_model_recipe_does_not_reuse_disk(monkeypatch):
@@ -250,9 +250,9 @@ def test_a_changed_model_recipe_does_not_reuse_disk(monkeypatch):
     assert len(stub.calls) == 2
 
 
-@pytest.mark.parametrize("name,want", [("default", "default"), ("mara-spaceport-chase", "mara-spaceport-chase"),
+@pytest.mark.parametrize("name,want", [("default", "default"), ("sample-project", "sample-project"),
                                        ("..", "default"), ("a/b\\c", "a_b_c"), ("", "default"),
-                                       ("Mara — chase", "Mara_chase")])
+                                       ("Sample — chase", "Sample_chase")])
 def test_cache_name_is_sanitised(name, want):
     assert store.safe_cache_name(name) == want
 
