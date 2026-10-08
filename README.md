@@ -1,7 +1,5 @@
 # ComfyUI — MiniMax H3 Long Shot
 
-Requires the [H3 Prompt Compiler](https://github.com/r34vtraining/H3_Prompt_Compiler) pack (for the Shot and Ref Prompt Builder r2v nodes) and a ComfyUI build with native MiniMax H3, arbitrary-frame guides, and the V3 node API.
-
 Render one continuous shot longer than a single H3 generation. Each **Shot**
 node in a chain becomes one generation; they're stitched in latent space and
 decoded once, so the joins are seamless. Optional lip sync to a song.
@@ -9,7 +7,7 @@ decoded once, so the joins are seamless. Optional lip sync to a song.
 A single Shot works too: it's one ordinary generation with nothing to stitch, so
 the same workflow covers any length.
 
-Requires the **comfyui-minimax-h3** prompt pack (for the Shot and Ref Prompt
+Requires the [H3 Prompt Compiler](https://github.com/r34vtraining/H3_Prompt_Compiler) pack (for the Shot and Ref Prompt
 Builder r2v nodes) and a ComfyUI build with native MiniMax H3, arbitrary-frame
 guides, and the V3 node API.
 
@@ -17,13 +15,18 @@ guides, and the V3 node API.
 
 ## Install
 
-```
+```bash
 cd ComfyUI/custom_nodes
 git clone https://github.com/r34vtraining/H3_Prompt_Compiler
 git clone https://github.com/r34vtraining/H3_Longshot
 ```
 
-Restart ComfyUI. No dependencies. Three nodes appear under **MiniMax H3**: Long Shot, Song Track, and RefMod Carrier.
+Restart ComfyUI. No extra dependencies (`safetensors` ships with ComfyUI). Three nodes appear under **MiniMax H3**: Long Shot, Song Track, and RefMod Carrier.
+
+**Updating from an earlier version.** The new widgets (`save_to_disk`, `cache_name`)
+come after the existing ones, so saved workflows keep their values. If your saved
+Long Shot shows `max` in `reuse_segments` (from the older widget shift), set it back
+to on and `ref_image_size` to your choice.
 
 ---
 
@@ -64,6 +67,14 @@ decode is what makes the joins invisible.
 
 **style_line** (on the builder) — restated at the start of every segment. Put
 your look here, not in the first Shot, or later segments drift.
+
+**reuse_segments** — on by default. Reuses segments that would come out
+identical, so a re-run only renders what changed. See *Re-rolling and building
+Shot by Shot* below.
+
+**save_to_disk** / **cache_name** — on by default. Finished segments are also
+saved to disk, so a crash or restart doesn't cost finished Shots. See *Saved
+segments* below.
 
 **dry_run** — outputs the full plan and every segment's prompt in a second,
 without sampling. Each segment costs minutes; check the plan first. Wire the
@@ -120,6 +131,101 @@ spot in the full song.
 
 ---
 
+## Re-rolling and building Shot by Shot
+
+Long Shot remembers every segment it renders. On the next run, any segment that
+would come out identical is reused instead of sampled, so only the Shots you
+changed, and the ones after them, render again.
+
+- **Build it up a Shot at a time.** Render Shots 1–2. Add Shot 3 and queue:
+  Shots 1–2 are reused and only Shot 3 renders. A segment depends only on the
+  segments before it, never on how many come after.
+- **Re-roll one Shot.** Set that Shot's `shot_seed` (on the Shot node) to any number.
+  `-1` follows Long Shot's seed: base + Shot number − 1 with `seed_mode`
+  increment. Only that Shot and the ones after it render again.
+- **Change a middle Shot** and it renders, along with every Shot after it,
+  since they continue from its ending.
+- **Interrupted?** Queue again. The segments that finished are kept.
+
+Set **RandomNoise** to *fixed* (its control after generate). On *randomize*,
+the base seed changes every queue and nothing can be reused.
+
+Each segment line in the plan says what will happen, dry run included:
+
+```
+Segment 4: asked 5s, got 4.96s · … · seed 1683 · reused (disk)
+Segment 5: asked 9s, got 9.04s · … · seed 1684 · reused (memory)
+Segment 6: asked 7s, got 7.04s · … · seed 77 (Shot seed) · will render — seed changed
+```
+
+The reasons: *prompt changed*, *seed changed*, *length changed*, *references
+changed*, *song changed*, *model, CLIP or VAE changed* (a new LoRA, a reloaded
+model), *sampler, sigmas or size changed*, *follows a changed segment*, or
+*first run*.
+
+Segments are kept in RAM until ComfyUI restarts, up to the 64 most recent, and
+on disk (below). Turn `reuse_segments` off to render everything fresh and store
+nothing.
+
+---
+
+## Saved segments (crash-proof resume)
+
+Every finished segment is also written to
+
+```
+ComfyUI/output/longshot/<cache_name>/segments/<fingerprint>.safetensors
+```
+
+When you queue again, after a crash, a restart or days later, Long Shot looks in RAM,
+then on disk, and only samples what's in neither. You never point at a file;
+just queue again.
+
+| reuse_segments | save_to_disk | Behaviour |
+|---|---|---|
+| on | on (default) | memory + disk |
+| on | off | memory only |
+| off | — | nothing is reused or stored |
+
+- **cache_name** names the folder (letters, digits, `. _ -`; anything else becomes `_`).
+  Use one per project. H3 Long Shot Studio sets it to the project's slug.
+- **Files.** Each file holds the segment's video and audio latents in fp16 (cast back
+  on load), plus metadata: segment, seconds, seed, shapes, Long Shot version and
+  creation time. That's about 1 MB per second of video at 0.6 MP and about 1.5 MB/s at
+  0.9 MP. Delete the folder whenever you like.
+- **Safe writes.** Writes go to a `.tmp` file first and are renamed when complete, so a
+  crash mid-write never leaves a file that looks valid. Leftover `.tmp` files are
+  removed on the next run. A damaged or wrong-shape file is ignored, and that
+  segment renders again.
+
+### What makes a segment "the same" after a restart
+
+The in-memory check identifies the model by object identity, which no restart
+survives. For disk, Long Shot fingerprints the **recipe** instead:
+
+- It follows its `model`, `clip`, `vae`, `audio_vae`, `sampler` and `sigmas` wires
+  upstream through the workflow and hashes every node's class and settings. That
+  includes model file names, LoRA strengths, shifts, Sage settings, scheduler and steps.
+- Node ids aren't part of it, so a rebuilt or renumbered graph matches.
+- Each model file's **size and modified time** go in with its name. Replacing a file
+  under the same name counts as a change; moving your models to another drive costs
+  one re-render.
+- Seeds, prompts, lengths, references (by content), the song slice and first/last
+  frames were already restart-proof.
+
+If a run comes from outside ComfyUI's executor (no workflow to read), segments stay
+in memory only, and the log says so.
+
+### The model only loads when something renders
+
+`model`, `clip`, `vae`, `audio_vae` and `sigmas` are *lazy* inputs. Long Shot works
+out the plan first and asks ComfyUI to load them only if a segment actually needs
+sampling. A dry run, or a re-run where every segment comes from memory or disk,
+never loads the model. After a restart you can re-decode or check a finished
+chain in seconds.
+
+---
+
 ## Timing
 
 H3 moves in 17-frame steps (~0.7s), so durations snap to the grid. Long Shot
@@ -163,28 +269,60 @@ be combined with reference inputs.
 
 ---
 
-## RefMods and other reference blocks
+## RefMods
 
-Long Shot encodes each segment itself, so there's no conditioning wire to
-splice a node like **Apply H3 RefMod** into. Use the `extra_refs` input, fed
-from **MiniMax H3 RefMod Carrier**:
+Connect **Load H3 RefMods** straight to Long Shot's `refmods` input:
+
+```
+Load H3 RefMods ─→ mods ─→ [refmods] MiniMax H3 Long Shot
+```
+
+Long Shot does what **H3 RefMod Text Encode** does, on every segment. Each
+RefMod is shown to the text encoder under its own label, and its reference
+goes to the model in the same order. That pairing is what lets a line in your
+subject definitions, like `<hero> … whose appearance comes from <Picture 2>`,
+actually point at the RefMod.
+
+RefMods take the next free labels after your reference inputs. With one
+`ref_image` connected, the first image RefMod is `<Picture 2>`. Only inputs
+that actually arrive are numbered: a muted or bypassed loader takes no label,
+and slot names don't matter. The `plan` output lists every live reference at
+the top, dry run included, so you can write your Subject boxes to match:
+
+```
+Reference labels — use these in your subject definitions:
+  <Picture 1> = ref_image_0
+  <Picture 2> = hero_face (RefMod)
+  <Video 1> = hero_walk (RefMod)
+```
+
+A RefMod bundle with several members gets one label per member.
+
+Each row's strength from the loader applies, and a row at 0 is left out
+entirely, label included. Visual RefMods are decoded for the text encoder once
+per run, not once per segment, so connect the H3 video VAE. RefMods count as
+references, so they can't be combined with `first_frame` / `last_frame`.
+
+**H3 RefMod Step Curve** patches the model rather than the conditioning, so it
+goes on the `model` wire before Long Shot as usual. It still finds the RefMods.
+
+### extra_refs: Apply H3 RefMod without labels
 
 ```
 MiniMax H3 RefMod Carrier ─→ [conditioning] Apply H3 RefMod ─→ [extra_refs] Long Shot
 ```
 
-RefMod needs a conditioning to attach its references to. The Carrier supplies
-an empty one, so the only thing reaching `extra_refs` is RefMod's own reference
-blocks. Long Shot adds them to every segment, after the native references.
+`extra_refs` takes reference blocks only. Use it when you want Apply H3
+RefMod's retention, curve, or scramble controls. Apply never shows a RefMod to
+the text encoder, so these blocks have **no label**: nothing in your prompt can
+point at them, and they act as unlabelled guidance. For a RefMod your prompt
+refers to, use `refmods`.
 
-Don't feed RefMod from a Reference to Video node that has references connected.
-Long Shot adds every reference block it receives, so those references would go
-in twice: once through Long Shot's own inputs and again through `extra_refs`.
-Long Shot logs a warning if `extra_refs` comes from anything other than the
-Carrier.
-
-**H3 RefMod Step Curve** patches the model rather than the conditioning, so it
-goes on the `model` wire before Long Shot as usual.
+The Carrier supplies the empty conditioning Apply needs, so only RefMod's own
+blocks reach `extra_refs`. Don't feed Apply from a Reference to Video node that
+has references connected, or those references go in twice. Long Shot warns
+when that happens, and also when the same RefMods seem to be connected to both
+`refmods` and `extra_refs`.
 
 ---
 
@@ -216,6 +354,24 @@ survives ComfyUI updates.
 
 ---
 
+## Front-end hooks (H3 Long Shot Studio)
+
+Long Shot also reports its work for front ends like H3 Long Shot Studio. None of this
+changes what it renders.
+
+- **Plan in `/history`.** The node returns its plan as a UI output: `text` holds the
+  same text as the `plan` output, and `plan_json` holds one row per segment with
+  `{index, seconds, frames, start, end, start_frame, window_frames, seed, own_seed,
+  status: "reused" | "render", reason}`. Dry runs include it too. On ComfyUI builds that
+  support `has_intermediate_output`, the plan is resent when a whole run is served from
+  ComfyUI's cache.
+- **Progress over the websocket.** For each segment, Long Shot sends `mmh3.longshot` with
+  `{segment, of, status: "reused" | "rendering" | "done", seed, seconds}` (plus
+  `source: "memory" | "disk"` on reused segments) to the client that queued the prompt.
+- Plan rows carry `source: "memory" | "disk"` for reused segments too.
+
+---
+
 ## Tests
 
 `tests/` runs the nodes against a real ComfyUI source tree (CPU mode, no model
@@ -227,6 +383,18 @@ that the model's own `PackedLayout` places every guide on the right frames.
 set COMFYUI_ROOT=C:\path\to\ComfyUI
 python -m pytest tests -q
 ```
+
+`test_frontend_hooks.py` covers the plan UI output, `plan_json` and the progress events,
+including a cached re-run through the real executor. `test_disk_segments.py` covers
+saved segments:
+
+- recipe fingerprints are identical with renumbered node ids, and change with any
+  upstream setting or a replaced model file;
+- save → restart → zero sampler calls, with exactly the fp16-rounded latent;
+- a resumed chain continues within fp16 rounding;
+- `.tmp` and corrupt files are handled;
+- memory-only and off modes;
+- through the real executor: a dry run and a fully reused run never load the model.
 
 Two optional suites run only when pointed at the other packs:
 `MMH3_PROMPT_PACK` (the comfyui-minimax-h3 folder) for the builder hand-off,
