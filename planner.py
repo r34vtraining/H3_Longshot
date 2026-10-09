@@ -199,7 +199,16 @@ def plan_from_durations(durations: list[float], overlap_frames: int) -> Plan:
         cursor += new
 
     plan = Plan(overlap_frames=overlap_frames, segments=segments)
-    for s in segments:
+    _window_warnings(plan)
+    return plan
+
+
+def _window_warnings(plan: Plan, skip=()) -> None:
+    """Notes on windows outside H3's trained range. Locked takes and clips are
+    skipped: they aren't sampled."""
+    for s in plan.segments:
+        if s.index in skip:
+            continue
         span = f"{s.window_frames} frames ({seconds(s.window_frames):.1f}s)"
         if s.window_frames > TRAINED_MAX_FRAMES:
             plan.warnings.append(
@@ -211,7 +220,107 @@ def plan_from_durations(durations: list[float], overlap_frames: int) -> Plan:
                 f"Segment {s.index} window is {span}, below H3's trained ~{TRAINED_MIN_FRAMES}. "
                 f"Consider merging it with a neighbour."
             )
+
+
+# ---------------------------------------------------------------------------
+# Timeline of pieces (round 2)
+#
+# Every piece's window is 17k + 5 frames. The first piece shows all of it;
+# every later piece drops its first `overlap` frames (the shared zone, owned by
+# the left piece's tail) and shows window - overlap = 17j frames. So any take
+# fits anywhere: a take rendered as the first piece just drops its head when
+# something is put before it, and a take rendered after another piece shows
+# its head when it becomes first.
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class PieceSpec:
+    requested_seconds: float
+    window: int | None = None     # fixed window (a locked take, or keep-length re-render)
+    locked: bool = False
+
+
+def plan_pieces(pieces: list[PieceSpec], overlap_frames: int) -> Plan:
+    """Lay out pieces with fixed or requested lengths.
+
+    Requested lengths snap their END on the timeline like plan_from_durations,
+    so rounding never accumulates; the running target restarts at every fixed
+    piece, whose length is exact. With no fixed pieces this is exactly
+    plan_from_durations."""
+    if not pieces:
+        raise ValueError("Connect at least one Shot node — one per segment.")
+    if len(pieces) > MAX_SEGMENTS:
+        raise ValueError(f"At most {MAX_SEGMENTS} segments are supported.")
+    if not is_valid_frame_count(overlap_frames):
+        raise ValueError(
+            f"overlap_frames must be on the 17k + 5 grid (5, 22, 39, 56 ...), got {overlap_frames}")
+    segments: list[Segment] = []
+    cursor = 0
+    ideal = 0.0                    # where requested lengths say we should be, in seconds
+    for i, p in enumerate(pieces, start=1):
+        first = i == 1
+        if p.window is not None:
+            w = int(p.window)
+            if not is_valid_frame_count(w):
+                raise ValueError(f"Shot {i}'s take is {w} frames, which is not on the 17k + 5 grid.")
+            if first and w < overlap_frames:
+                raise ValueError(
+                    f"Shot 1 is {seconds(w):.2f}s, shorter than the {overlap_frames}-frame "
+                    f"overlap it has to supply. Lengthen it or reduce overlap_frames.")
+            if not first and w - overlap_frames < GROUP_FRAMES:
+                raise ValueError(
+                    f"Shot {i}'s take is {seconds(w):.2f}s; after the {overlap_frames}-frame "
+                    f"shared zone it would show nothing. Re-render it longer.")
+            new = w if first else w - overlap_frames
+            end = cursor + new
+            ideal = seconds(end)
+        else:
+            if p.requested_seconds <= 0:
+                raise ValueError(f"Shot {i} has a duration of {p.requested_seconds}s; it must be positive.")
+            ideal += p.requested_seconds
+            end = nearest_valid(ideal * FPS)
+            if first:
+                if end < overlap_frames:
+                    raise ValueError(
+                        f"Shot 1 is {seconds(end):.2f}s, shorter than the {overlap_frames}-frame "
+                        f"overlap it has to supply. Lengthen it or reduce overlap_frames.")
+            elif end < cursor + GROUP_FRAMES:
+                end = cursor + GROUP_FRAMES
+            new = end - cursor
+        if first:
+            ov, ws, window = 0, 0, new
+            ov_v = ov_a = 0
+            new_v, new_a = video_tokens(window), audio_at(window)
+            win_a = new_a
+        else:
+            ov, ws = overlap_frames, cursor - overlap_frames
+            window = ov + new
+            ov_v = video_tokens(ov)
+            new_v = new // GROUP_FRAMES * 5
+            ov_a = audio_at(cursor) - audio_at(cursor - ov)
+            new_a = audio_at(cursor + new) - audio_at(cursor)
+            win_a = ov_a + new_a
+            if ov_v + new_v != video_tokens(window):
+                raise AssertionError("window does not satisfy the H3 video grid")
+        segments.append(Segment(
+            index=i, requested_seconds=p.requested_seconds, window_frames=window,
+            overlap_frames=ov, new_frames=new, visible_start=cursor, window_start=ws,
+            overlap_video_tokens=ov_v, overlap_audio_tokens=ov_a,
+            new_video_tokens=new_v, new_audio_tokens=new_a, window_audio_tokens=win_a))
+        cursor += new
+    plan = Plan(overlap_frames=overlap_frames, segments=segments)
+    _window_warnings(plan, skip={i + 1 for i, p in enumerate(pieces) if p.locked})
     return plan
+
+
+def tail_audio_tokens(seg: Segment, overlap_frames: int) -> int:
+    """Audio tokens in this window's last `overlap_frames` frames, by global position."""
+    return audio_at(seg.window_end) - audio_at(seg.window_end - overlap_frames)
+
+
+def head_audio_tokens(seg: Segment, overlap_frames: int) -> int:
+    """Audio tokens in this window's first `overlap_frames` frames, by global position."""
+    return audio_at(seg.window_start + overlap_frames) - audio_at(seg.window_start)
 
 
 # ---------------------------------------------------------------------------

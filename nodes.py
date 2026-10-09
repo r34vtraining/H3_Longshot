@@ -554,6 +554,7 @@ def _recall(fp):
 def clear_segment_cache():
     _SEGMENT_CACHE.clear()
     _LAST_RUN.clear()
+    _LAST_TIMELINE.clear()
 
 
 def _append(cumulative, sampled, seg):
@@ -711,6 +712,13 @@ def run_long_shot(*args, **kwargs):
 
 
 STORE_ROOT = None          # None: <ComfyUI output>/longshot (tests point it elsewhere)
+def _require_audio_vae(refs, audio_vae):
+    """Reference audio is only encoded when a Shot renders, so the audio VAE is
+    only required then: a fully locked or reused run never loads it."""
+    if (refs.get("ref_audios") or refs.get("ref_video_audios")) and audio_vae is None:
+        raise ValueError("Reference audio is connected — connect the H3 audio VAE to audio_vae.")
+
+
 LAZY_INPUTS = ("model", "clip", "vae", "sigmas", "audio_vae")
 
 
@@ -745,14 +753,21 @@ def _prepare(model, clip, vae, noise, sampler, sigmas, prompt, width, height,
         raise ValueError(
             "first_frame / last_frame use H3's image-to-video path and can't be combined "
             "with reference inputs or RefMods. Connect one or the other.")
-    if (refs["ref_audios"] or refs["ref_video_audios"]) and audio_vae is None \
-            and not _planning_only:
-        raise ValueError("Reference audio is connected — connect the H3 audio VAE to audio_vae.")
     for name in refs["ref_video_audios"]:
         if "ref_video_" + name.rsplit("_", 1)[-1] not in refs["ref_videos"]:
             raise ValueError(
                 f"{name} has no matching {'ref_video_' + name.rsplit('_', 1)[-1]}. A video "
                 f"soundtrack only counts when its video is connected too.")
+
+    if is_timeline(shots):
+        return _prepare_timeline(
+            shots=shots, bundle=bundle, refs=refs, labels=labels, native_refs=native_refs,
+            model=model, clip=clip, vae=vae, audio_vae=audio_vae, noise=noise, sampler=sampler,
+            sigmas=sigmas, width=width, height=height, overlap_frames=overlap_frames,
+            seed_mode=seed_mode, reuse_segments=reuse_segments, ref_image_size=ref_image_size,
+            song=song, first_frame=first_frame, last_frame=last_frame, extra_refs=extra_refs,
+            refmods=refmods, save_to_disk=save_to_disk, cache_name=cache_name, recipe=_recipe,
+            planning_only=_planning_only)
 
     plan = planner.plan_from_durations([float(s.get("seconds", 0)) for s in shots],
                                        overlap_frames)
@@ -790,7 +805,7 @@ def _prepare(model, clip, vae, noise, sampler, sigmas, prompt, width, height,
     return SimpleNamespace(plan=plan, prompts=prompts, seeds=seeds, own_seeds=own_seeds,
                            components=components, fingerprints=fingerprints,
                            statuses=statuses, store=seg_store, refs=refs, labels=labels,
-                           extra_blocks=extra_blocks, bundle=bundle)
+                           extra_blocks=extra_blocks, bundle=bundle, timeline=False)
 
 
 def _window_shapes(seg, width, height):
@@ -810,6 +825,12 @@ def _run_long_shot(model, clip, vae, noise, sampler, sigmas, prompt, width, heig
                  overlap_frames, seed_mode, dry_run, reuse_segments, ref_image_size, audio_vae,
                  song, first_frame, last_frame, extra_refs, refmods, ref_images, ref_videos,
                  ref_video_audios, ref_audios, save_to_disk, cache_name, _recipe)
+    if p.timeline:
+        return _run_timeline(p, model=model, clip=clip, vae=vae, audio_vae=audio_vae,
+                             noise=noise, sampler=sampler, sigmas=sigmas, width=width,
+                             height=height, dry_run=dry_run, reuse_segments=reuse_segments,
+                             ref_image_size=ref_image_size, song=song, first_frame=first_frame,
+                             last_frame=last_frame, refmods=refmods)
     plan, prompts, seeds, own_seeds = p.plan, p.prompts, p.seeds, p.own_seeds
     components, fingerprints, statuses = p.components, p.fingerprints, p.statuses
     refs, labels, extra_blocks, seg_store = p.refs, p.labels, p.extra_blocks, p.store
@@ -893,6 +914,7 @@ def _run_long_shot(model, clip, vae, noise, sampler, sigmas, prompt, width, heig
         logger.info("MiniMax H3 Long Shot: segment %d/%d, %d-frame window, seed %s",
                     seg.index, len(prompts), seg.window_frames, seeds[i])
         if encoder is None:
+            _require_audio_vae(refs, audio_vae)
             encoder = _RefEncoder(clip, vae, audio_vae, width, height, refs, ref_image_size,
                                   refmods)
 
@@ -939,6 +961,593 @@ def _run_long_shot(model, clip, vae, noise, sampler, sigmas, prompt, width, heig
     return (cumulative, plan.total_frames, total_s, report), rows
 
 
+# ---------------------------------------------------------------------------
+# Timeline mode (round 2): pieces, shared zones, pins and locked takes
+#
+# A Shot chain whose entries carry an "id" (MiniMax H3 Timeline Shot, or H3
+# Long Shot Studio) is a timeline of pieces instead of a one-way chain:
+#
+# * Every boundary has a shared zone of overlap_frames, owned by the left
+#   piece's tail; the right piece drops its first overlap_frames.
+# * A locked piece loads its take (a file in output/longshot/<cache>/takes)
+#   instead of sampling.
+# * A piece that renders is pinned at its start to its left neighbour's tail
+#   (as in round 1) and, when its right neighbour is locked, at its end to a
+#   fixed slice: its own old tail when that neighbour was continued from it,
+#   otherwise the neighbour's head. After sampling the end slice is written
+#   back exactly, so the locked neighbour joins without a seam.
+# * A rendered piece's fingerprint is its own inputs plus the identity of its
+#   pin sources, so moving pieces around never re-renders an unchanged one.
+# ---------------------------------------------------------------------------
+
+_LAST_TIMELINE = {}      # shot id -> {"comps": {...}, "start": ..., "end": ...}
+
+_PIN_REASONS = (("start", "start pin changed"), ("end", "end pin changed"))
+
+
+def is_timeline(shots):
+    return any(isinstance(sh, dict) and sh.get("id") for sh in shots or [])
+
+
+def piece_components(sp, seed, noise, shared, song):
+    """segment_components without the window's position: a piece's result
+    doesn't depend on where it sits, only on its pins (and its song slice)."""
+    seg = sp.segment
+    comps = segment_components(sp, seed, noise, shared, song)
+    comps["length"] = _digest([seg.window_frames, seg.overlap_frames, seg.new_frames])
+    return comps
+
+
+def _fit_audio(audio, n):
+    """A take's audio placed where the 40 Hz grid gives one token more or less
+    than where it was rendered: drop or repeat the last token."""
+    have = audio.shape[-1]
+    if have == n:
+        return audio
+    if abs(have - n) > 2:
+        raise RuntimeError(f"audio of {have} tokens can't fill a {n}-token slot")
+    if have > n:
+        return audio[..., :n]
+    return torch.cat([audio] + [audio[..., -1:]] * (n - have), -1)
+
+
+def _shot_label(i):
+    return f"Shot {i + 1}"
+
+
+def _prepare_timeline(*, shots, bundle, refs, labels, native_refs, model, clip, vae, audio_vae,
+                      noise, sampler, sigmas, width, height, overlap_frames, seed_mode,
+                      reuse_segments, ref_image_size, song, first_frame, last_frame, extra_refs,
+                      refmods, save_to_disk, cache_name, recipe, planning_only):
+    from types import SimpleNamespace
+    takes = disk.TakeStore(cache_name, STORE_ROOT)
+    n = len(shots)
+    ids = [str(sh.get("id") or f"seg{i + 1}") for i, sh in enumerate(shots)]
+    if len(set(ids)) != n:
+        raise ValueError("Two Shots in the timeline have the same id.")
+    joins = []
+    for i, sh in enumerate(shots):
+        j = (sh.get("join") or "bridge").lower()
+        if j not in ("bridge", "cut"):
+            raise ValueError(f"{_shot_label(i)}: join must be 'bridge' or 'cut', not {j!r}.")
+        joins.append("cut" if i and j == "cut" else ("bridge" if i else None))
+
+    # Clips: never sampled; they sit in the timeline like a locked take.
+    kinds = ["clip" if sh.get("kind") == "clip" else "shot" for sh in shots]
+    for i in range(1, n):
+        if kinds[i] == "clip" and kinds[i - 1] == "clip":
+            joins[i] = "cut"                     # nothing generated between them to bridge
+    ovt_ = planner.video_tokens(overlap_frames)
+    if first_frame is not None and kinds[0] == "clip":
+        raise ValueError("first_frame guides the first generated Shot, but the timeline starts "
+                         "with a clip. Disconnect first_frame or start with a Shot.")
+    if last_frame is not None and kinds[-1] == "clip":
+        raise ValueError("last_frame guides the last generated Shot, but the timeline ends with "
+                         "a clip. Disconnect last_frame or end with a Shot.")
+    locks = [None] * n
+    for i, sh in enumerate(shots):
+        if kinds[i] != "clip":
+            continue
+        c = sh.get("clip")
+        if not isinstance(c, dict) or "video" not in c:
+            raise ValueError(f"{_shot_label(i)} is a clip with no prepared video (MiniMax H3 Clip).")
+        if (c.get("width"), c.get("height")) != (width, height):
+            raise ValueError(f"{_shot_label(i)}'s clip was prepared at {c.get('width')}x{c.get('height')}; "
+                             f"the film is {width}x{height}. Prepare it at the film's size.")
+        if c["frames"] <= overlap_frames:
+            raise ValueError(f"{_shot_label(i)}'s clip is {planner.seconds(c['frames']):.2f}s, too short "
+                             f"to join with a {overlap_frames}-frame shared zone. Use a longer trim.")
+        ident = c.get("digest") or _digest([c["video"], c["audio"]])
+        # Identity strings rather than latent hashes: a clip re-encoded after a
+        # restart can differ in the last bits, but it's the same clip.
+        locks[i] = {"name": f"clip:{ids[i]}", "clip": c, "window_frames": c["frames"],
+                    "fp": ident, "seed": None,
+                    "head": f"clip:{ident}:head:{overlap_frames}",
+                    "tail": f"clip:{ident}:tail:{overlap_frames}",
+                    "left_take": None, "left_tail": None}
+
+    # Locked takes: metadata only, so planning never loads tensors.
+    for i, sh in enumerate(shots):
+        if kinds[i] == "clip":
+            continue
+        name = sh.get("lock") or None
+        if not name:
+            continue
+        meta = takes.meta(name)
+        if meta is None:
+            raise ValueError(
+                f"{_shot_label(i)}'s approved take is missing ({name}); re-render it or unlock it.")
+        bad = [f"{k} {meta.get(k)} (now {v})" for k, v in
+               (("width", width), ("height", height), ("overlap", overlap_frames))
+               if meta.get(k) != v]
+        if bad:
+            raise ValueError(f"{_shot_label(i)}'s take was made with " + ", ".join(bad)
+                             + ". Re-render it or unlock it.")
+        locks[i] = meta
+
+    specs = []
+    for i, sh in enumerate(shots):
+        keep = sh.get("frames")
+        window = locks[i]["window_frames"] if locks[i] else (
+            int(keep) if keep and planner.is_valid_frame_count(int(keep)) else None)
+        specs.append(planner.PieceSpec(float(sh.get("seconds", 0) or 0), window, bool(locks[i])))
+    plan = planner.plan_pieces(specs, overlap_frames)
+    if song is not None:
+        need, have = plan.total_audio_tokens, song["latent"].shape[-1]
+        if have < need:
+            raise ValueError(
+                f"The song covers {have / planner.AUDIO_LATENT_FPS:.2f}s but the shots add up to "
+                f"{planner.seconds(plan.total_frames):.2f}s. Shorten the shots or give Song "
+                f"Track a longer duration.")
+
+    extra_blocks = _extra_ref_blocks(extra_refs) if not planning_only else \
+        [b for e in (extra_refs or []) for b in (e[1].get("minimax_refs", []) or [])]
+    prompts = planner.build_prompts(
+        shots, plan, bundle, reference_mode=native_refs or bool(labels) or bool(extra_blocks),
+        audio_reuse=song is not None,
+        use_first_frame=first_frame is not None, use_last_frame=last_frame is not None)
+    seeds, own_seeds = segment_seeds(noise, seed_mode, shots)
+    for i, m in enumerate(locks):
+        if m is not None and m.get("seed") is not None:
+            seeds[i], own_seeds[i] = m["seed"], True
+        elif m is not None and m.get("clip") is not None:
+            seeds[i], own_seeds[i] = None, False
+    shared = shared_components(
+        model=model, clip=clip, vae=vae, audio_vae=audio_vae, sampler=sampler,
+        sigmas=sigmas, width=width, height=height, refs=refs, ref_image_size=ref_image_size,
+        refmods=refmods, extra_blocks=extra_blocks, first_frame=first_frame,
+        last_frame=last_frame, recipe=recipe)
+    comps = [piece_components(sp, seeds[i], noise, shared, song) for i, sp in enumerate(prompts)]
+
+    # Pins and fingerprints, left to right.
+    ov = overlap_frames
+    starts, ends, fps, seams = [None] * n, [None] * n, [None] * n, [None] * n
+    prevs, reuse_own = [None] * n, [None] * n
+    for i in range(n):
+        left = i - 1 if i and joins[i] == "bridge" and kinds[i] != "clip" else None
+        if left is not None:
+            starts[i] = ({"from": left, "kind": "take_tail", "hash": locks[left]["tail"],
+                          "take": locks[left]["name"]} if locks[left] else
+                         {"from": left, "kind": "render", "fp": fps[left]})
+        if locks[i]:
+            continue
+        r = i + 1
+        if r < n and locks[r] and joins[r] == "bridge":
+            prev_take = locks[r].get("left_take") or ""
+            own = prev_take and disk.take_shot(prev_take) == disk.safe_shot_id(ids[i])
+            old = takes.meta(prev_take) if own else None
+            if old is not None and old.get("tail"):
+                ends[i] = {"to": r, "kind": "old_tail", "take": prev_take, "hash": old["tail"]}
+            else:
+                ends[i] = {"to": r, "kind": "head", "take": locks[r]["name"],
+                           "hash": locks[r]["head"]}
+            if plan.segments[i].window_frames - ov < (ov if starts[i] or i else 1):
+                raise ValueError(
+                    f"{_shot_label(i)} is too short to be pinned at both ends. Make it at least "
+                    f"{planner.seconds(2 * ov + planner.GROUP_FRAMES):.1f}s.")
+        if starts[i] is None:
+            prev = ""
+        elif starts[i]["kind"] == "take_tail":
+            # The fingerprint the left take was made with, so a Shot keeps
+            # its fingerprint whether the one before it is locked or not.
+            prev = locks[i - 1].get("fp") or ("tail:" + starts[i]["hash"])
+        else:
+            prev = starts[i]["fp"]
+        prevs[i] = prev
+        parts = [prev, [comps[i][k] for k, _ in _REASONS]]
+        if ends[i] and ends[i]["kind"] == "old_tail":
+            # Nothing about this Shot changed: its current take is exactly what
+            # the locked Shot after it was continued from. Keep it.
+            same = _digest(parts)
+            old_meta = takes.meta(ends[i]["take"])
+            if old_meta is not None and old_meta.get("fp") == same:
+                fps[i], ends[i], reuse_own[i] = same, None, ends[i]["take"]
+                continue
+        if ends[i]:
+            parts.append(["end", ends[i]["hash"]])
+        fps[i] = _digest(parts)
+
+    # Seams: does each locked piece still join the piece before it?
+    for i in range(1, n):
+        if joins[i] == "cut":
+            seams[i] = "cut"
+            continue
+        if not locks[i]:
+            seams[i] = "ok"
+            continue
+        left = i - 1
+        if kinds[i] == "clip":
+            # ok when the Shot before it leads into the clip's head
+            led = (locks[left].get("end_src") if locks[left] else
+                   ends[left]["hash"] if ends[left] else None)
+            seams[i] = "ok" if led == locks[i]["head"] else "mismatch"
+            continue
+        actual = (locks[left]["tail"] if locks[left] else
+                  ends[left]["hash"] if ends[left] else None)
+        seams[i] = "ok" if actual in (locks[i].get("left_tail"), locks[i].get("head")) else "mismatch"
+
+    # Round-1 saved segments, adopted once when the timeline is laid out the
+    # way round 1 laid it out (nothing locked, no end pins, no cuts).
+    legacy = [None] * n
+    if (recipe is not None and reuse_segments and not any(locks) and not any(ends)
+            and all(j != "cut" for j in joins)):
+        old_plan = planner.plan_from_durations([float(sh.get("seconds", 0)) for sh in shots], ov)
+        if [s.window_frames for s in old_plan.segments] == [s.window_frames for s in plan.segments]:
+            old_store = disk.SegmentStore(cache_name, STORE_ROOT)
+            old_fps = chain_fingerprints([segment_components(sp, seeds[i], noise, shared, song)
+                                          for i, sp in enumerate(prompts)])
+            for i, fp in enumerate(old_fps):
+                if not old_store.has(fp):
+                    break
+                legacy[i] = (old_store, fp)
+
+    statuses, take_names = [], [None] * n
+    for i in range(n):
+        if kinds[i] == "clip":
+            statuses.append("clip")
+            continue
+        if locks[i]:
+            statuses.append("locked")
+            take_names[i] = locks[i]["name"]
+            continue
+        name = reuse_own[i] or (takes.find(ids[i], seeds[i], fps[i]) if recipe is not None else None)
+        if reuse_own[i] and reuse_segments:
+            statuses.append("reused (disk)")
+            take_names[i] = name
+        elif reuse_segments and fps[i] in _SEGMENT_CACHE:
+            statuses.append("reused (memory)")
+        elif reuse_segments and name:
+            statuses.append("reused (disk)")
+            take_names[i] = name
+        elif reuse_segments and legacy[i]:
+            statuses.append("reused (disk)")
+        else:
+            last = _LAST_TIMELINE.get(ids[i])
+            if not reuse_segments:
+                why = "reuse off"
+            elif last is None:
+                why = "new take"
+            else:
+                now = {"comps": comps[i], "start": prevs[i], "end": _pin_identity(ends[i])}
+                changed = [label for key, label in _REASONS if now["comps"][key] != last["comps"][key]]
+                changed += [label for key, label in _PIN_REASONS if now[key] != last[key]]
+                why = changed[0] if changed else "not in memory"
+            statuses.append(f"will render — {why}")
+    return SimpleNamespace(
+        timeline=True, plan=plan, prompts=prompts, seeds=seeds, own_seeds=own_seeds,
+        components=comps, fingerprints=fps, statuses=statuses, store=takes, refs=refs,
+        labels=labels, extra_blocks=extra_blocks, bundle=bundle, ids=ids, joins=joins,
+        locks=locks, starts=starts, ends=ends, seams=seams, legacy=legacy, prevs=prevs, kinds=kinds,
+        take_names=take_names, save=save_to_disk, recipe=recipe, overlap=ov)
+
+
+def _pin_identity(pin):
+    if pin is None:
+        return None
+    return pin.get("hash") or pin.get("fp")
+
+
+def _pin_text(p, i):
+    bits = []
+    st, en = p.starts[i], p.ends[i]
+    if st:
+        bits.append(f"start ← {_shot_label(st['from'])} tail")
+    if en:
+        bits.append("end → its old tail (keeps " + _shot_label(en["to"]) + ")"
+                    if en["kind"] == "old_tail" else f"end → {_shot_label(en['to'])} head")
+    if p.joins[i] == "cut":
+        bits.append("cut")
+    if p.seams[i] == "mismatch":
+        bits.append("hard cut: continued from a different take")
+    return " · ".join(bits)
+
+
+def timeline_rows(p, show_seeds=True):
+    rows = plan_rows(p.plan, p.seeds, p.own_seeds,
+                     ["reused (take)" if s in ("locked", "clip") else s for s in p.statuses], show_seeds)
+    for i, row in enumerate(rows):
+        st, en = p.starts[i], p.ends[i]
+        row.update({
+            "kind": p.kinds[i],
+            "id": p.ids[i],
+            "locked": bool(p.locks[i]),
+            "take": p.take_names[i],
+            "join": p.joins[i],
+            "seam": p.seams[i],
+            "pins": {
+                "start": {"from": st["from"] + 1} if st else None,
+                "end": ({"to": en["to"] + 1, "kind": en["kind"], "take": en["take"]}
+                        if en else None),
+            },
+        })
+        if p.kinds[i] == "clip":
+            row.update(status="clip", source="clip", reason=None, take=None, seed=None)
+        elif p.locks[i]:
+            row.update(status="locked", source="take", reason=None)
+    return rows
+
+
+def _load_take(p, name, i=None):
+    if isinstance(name, str) and name.startswith("clip:"):
+        for m in p.locks:
+            if m is not None and m.get("name") == name and m.get("clip") is not None:
+                c = m["clip"]
+                return c["video"], c["audio"], m
+        raise ValueError(f"The clip {name[5:]} isn't in this run.")
+    try:
+        return p.store.load(name)
+    except FileNotFoundError:
+        who = f"{_shot_label(i)}'s take" if i is not None else "A take this run needs"
+        raise ValueError(f"{who} is missing ({name}); it was deleted while the run started. "
+                         f"Re-render it or unlock it.") from None
+
+
+def _run_timeline(p, *, model, clip, vae, audio_vae, noise, sampler, sigmas, width, height,
+                  dry_run, reuse_segments, ref_image_size, song, first_frame, last_frame,
+                  refmods):
+    plan, prompts, seeds = p.plan, p.prompts, p.seeds
+    n = len(prompts)
+    ov = p.overlap
+    ovt = planner.video_tokens(ov)
+    show_seeds = seeds if getattr(noise, "seed", None) is not None else None
+    label_text = ""
+    live = native_labels(p.refs)
+    if live or p.labels:
+        rows = [f"  {label} = {name}" for label, name in live]
+        rows += [f"  {label} = {name} (RefMod)" for label, name, _kind in p.labels]
+        label_text = ("Reference labels — use these in your subject definitions:\n"
+                      + "\n".join(rows) + "\n\n")
+    text_status = []
+    for i, s in enumerate(p.statuses):
+        extra = _pin_text(p, i)
+        text_status.append(s + (f" · {extra}" if extra else ""))
+    plan_args = dict(song_offset=song["offset"] if song is not None else None,
+                     statuses=text_status, own_seeds=p.own_seeds)
+    report = label_text + planner.render_plan(plan, prompts, show_seeds, **plan_args)
+    report += f"\nTakes: {p.store.folder}"
+    logger.info("\n%s%s", label_text, planner.render_plan(
+        plan, prompts, show_seeds, include_prompts=False, **plan_args))
+    total_s = planner.seconds(plan.total_frames)
+
+    if dry_run:
+        from comfy_execution.graph_utils import ExecutionBlocker
+        return (ExecutionBlocker(None), plan.total_frames, total_s, report), \
+            timeline_rows(p, show_seeds is not None)
+
+    from comfy.nested_tensor import NestedTensor
+    import comfy.model_management
+    p.store.clean_tmp()
+    checked = False
+    encoder = None
+
+    def progress(i, status, source=None):
+        seg = plan.segments[i]
+        event = {"segment": i + 1, "of": n, "status": status, "id": p.ids[i],
+                 "seed": seeds[i] if show_seeds is not None else None,
+                 "seconds": round(planner.seconds(seg.new_frames), 4)}
+        if source:
+            event["source"] = source
+        _notify(event)
+
+    placed = [None] * n          # (video, audio) per piece, audio fitted to its slot
+
+    def place(i, video, audio):
+        seg = plan.segments[i]
+        if video.shape[2] != planner.video_tokens(seg.window_frames):
+            raise RuntimeError(f"{_shot_label(i)}'s take has {video.shape[2]} video tokens; "
+                               f"its {seg.window_frames}-frame window needs "
+                               f"{planner.video_tokens(seg.window_frames)}.")
+        placed[i] = (video, _fit_audio(audio, seg.window_audio_tokens))
+
+    def zone_audio(i, at_end):
+        """Audio of piece i's head or tail zone as it sits now."""
+        seg = plan.segments[i]
+        a = placed[i][1]
+        if at_end:
+            return a[..., -planner.tail_audio_tokens(seg, ov):]
+        return a[..., :planner.head_audio_tokens(seg, ov)]
+
+    def left_hash(i):
+        st = p.starts[i]
+        if st is None:
+            return ""
+        if p.kinds[st["from"]] == "clip":
+            return p.locks[st["from"]]["tail"]
+        return disk.slice_hash(placed[st["from"]][0][:, :, -ovt:])
+
+    def song_span(f0, f1):
+        return song["latent"][..., planner.audio_at(f0):planner.audio_at(f1)].clone()
+
+    for i in range(n):
+        seg = plan.segments[i]
+        comfy.model_management.throw_exception_if_processing_interrupted()
+        status = p.statuses[i]
+        if status in ("locked", "clip"):
+            v, a, _meta = _load_take(p, p.locks[i]["name"], i)
+            place(i, v, a)
+            progress(i, "reused", "clip" if status == "clip" else "take")
+            continue
+        fp = p.fingerprints[i]
+        got = None
+        if status == "reused (memory)":
+            got, source = _recall(fp), "memory"
+        if got is None and status.startswith("reused") and p.take_names[i]:
+            try:
+                v, a, _meta = p.store.load(p.take_names[i])
+                got, source = {"samples": NestedTensor((v, a))}, "disk"
+            except (OSError, ValueError):
+                got = None
+        if got is None and status.startswith("reused") and p.legacy[i]:
+            old_store, old_fp = p.legacy[i]
+            loaded = old_store.load(old_fp, *_window_shapes(seg, width, height))
+            if loaded is not None:
+                got, source = {"samples": NestedTensor(loaded)}, "disk"
+        if got is not None:
+            v, a = got["samples"].tensors
+            place(i, v, a)
+            if reuse_segments:
+                _remember(fp, got)
+            _keep_take(p, i, v, a, left_hash(i))
+            progress(i, "reused", source)
+            continue
+
+        # --- render -----------------------------------------------------------
+        if clip is None or vae is None:
+            raise RuntimeError(
+                f"{_shot_label(i)} has to render, but the model wasn't loaded because the plan "
+                f"expected to reuse it (a take may have been deleted while the run started). "
+                f"Queue again.")
+        if not checked:
+            _native()
+            _require_arbitrary_guides()
+            checked = True
+        progress(i, "rendering")
+        logger.info("MiniMax H3 Long Shot: %s, %d-frame window, seed %s", _shot_label(i),
+                    seg.window_frames, seeds[i])
+        if encoder is None:
+            _require_audio_vae(p.refs, audio_vae)
+            encoder = _RefEncoder(clip, vae, audio_vae, width, height, p.refs, ref_image_size,
+                                  refmods)
+        sp = prompts[i]
+        positive = encoder.encode(sp.prompt, seg.window_frames,
+                                  first_frame if sp.first_frame else None,
+                                  last_frame if sp.last_frame else None)
+        positive = _add_ref_blocks(positive, p.extra_blocks)
+        st, en = p.starts[i], p.ends[i]
+        kfs = _keyframes(positive)
+        if st is not None:
+            lv = placed[st["from"]][0]
+            for k in kfs:
+                if 0 <= float(k["resolved_frame_index"]) < ov:
+                    raise ValueError(f"{_shot_label(i)} already has a guide inside its shared "
+                                     f"zone, which would fight the continuation.")
+            kfs.append({"resolved_frame_index": 0,
+                        "latent": lv[:, :, -ovt:].clone(),
+                        "audio_latent": (song_span(seg.window_start, seg.window_end)
+                                         if song is not None else zone_audio(st["from"], True).clone())})
+        elif song is not None:
+            positive = _pin_audio_at_zero(positive, song_span(seg.window_start, seg.window_end))
+            kfs = _keyframes(positive)
+        end_v = end_a = None
+        if en is not None:
+            # The zone's audio is exactly what the neighbour drops (or showed),
+            # counted by global position.
+            n_tail = planner.tail_audio_tokens(seg, ov)
+            if en["kind"] == "old_tail":
+                ov_v, ov_a, _ov_meta = _load_take(p, en["take"])
+                end_v = ov_v[:, :, -ovt:]
+                end_a = ov_a[..., -n_tail:]
+            else:
+                rv, ra, _r_meta = _load_take(p, en["take"])
+                end_v = rv[:, :, :ovt]
+                end_a = ra[..., :n_tail]
+            end_a = _fit_audio(end_a, n_tail)
+            ref_dtype = placed[st["from"]][0] if st is not None else None
+            end_v = end_v.to(ref_dtype) if ref_dtype is not None else end_v.float()
+            end_a = end_a.to(end_v.dtype)
+            end_guide = {"resolved_frame_index": seg.window_frames - ov, "latent": end_v.clone()}
+            if song is None:
+                end_guide["audio_latent"] = end_a.clone()
+            kfs.append(end_guide)
+        if kfs:
+            positive = _set_keyframes(positive, kfs)
+        like = placed[st["from"]][0] if st is not None else None
+        target = _empty_window(width, height, seg, like=like)
+        sampled = _sample_window(model, _segment_noise(noise, seeds[i]),
+                                 sampler, sigmas, positive, target)
+        v, a = sampled["samples"].tensors
+        if end_v is not None:
+            # write the end slice back exactly, so the locked neighbour is untouched
+            v = v.clone()
+            a = a.clone()
+            v[:, :, -ovt:] = end_v.to(v)
+            a[..., -end_a.shape[-1]:] = end_a.to(a)
+            sampled = {"samples": NestedTensor((v, a))}
+        _LAST_TIMELINE[p.ids[i]] = {"comps": p.components[i], "start": p.prevs[i],
+                                    "end": _pin_identity(en)}
+        place(i, v, a)
+        if reuse_segments:
+            _remember(fp, sampled)
+        _keep_take(p, i, v, a, left_hash(i))
+        progress(i, "done")
+
+    cumulative = {"samples": NestedTensor(placed[0])}
+    for i in range(1, n):
+        cumulative = _append(cumulative, {"samples": NestedTensor(placed[i])}, plan.segments[i])
+    v, a = cumulative["samples"].tensors
+    if v.shape[2] != plan.total_video_tokens or a.shape[-1] != plan.total_audio_tokens:
+        raise RuntimeError(
+            f"Stitched latent is {v.shape[2]} video / {a.shape[-1]} audio tokens; expected "
+            f"{plan.total_video_tokens} / {plan.total_audio_tokens}.")
+    if song is not None:
+        a = song["latent"][..., :plan.total_audio_tokens].to(a)
+        cumulative = {"samples": NestedTensor((v, a))}
+    spans = []
+    for i, seg in enumerate(plan.segments):
+        if p.kinds[i] == "clip":
+            spans.append({"start": seg.visible_start, "frames": seg.new_frames,
+                          "offset": seg.overlap_frames, "pixels": p.locks[i]["clip"]["pixels"]})
+    if spans:
+        cumulative["mmh3_clips"] = spans
+    return (cumulative, plan.total_frames, total_s, report), timeline_rows(p, show_seeds is not None)
+
+
+def _keep_take(p, i, video, audio, left_tail=""):
+    """Save piece i as a take (once), so the Studio can lock it later."""
+    if not p.save or p.locks[i]:
+        return
+    ov = p.overlap
+    ovt = planner.video_tokens(ov)
+    seg = p.plan.segments[i]
+    name = disk.TakeStore.take_name(p.ids[i], p.seeds[i], p.fingerprints[i])
+    p.take_names[i] = name
+    if p.store.exists(name):
+        meta = p.store.meta(name)
+        if meta is not None and meta.get("fp") == p.fingerprints[i]:
+            return
+    st, en = p.starts[i], p.ends[i]
+    left_take = ""
+    if st is not None:
+        left_take = p.take_names[st["from"]] or ""
+    meta = {
+        "shot_id": p.ids[i], "seed": p.seeds[i], "fp": p.fingerprints[i],
+        "window_frames": seg.window_frames, "overlap": ov,
+        "width": video.shape[4] * 16, "height": video.shape[3] * 16,
+        "head": disk.slice_hash(video[:, :, :ovt]), "tail": disk.slice_hash(video[:, :, -ovt:]),
+        "head_audio": planner.head_audio_tokens(seg, ov),
+        "tail_audio": planner.tail_audio_tokens(seg, ov),
+        "left_take": left_take, "left_tail": left_tail,
+        "end_src": en["hash"] if en else "",
+        "seconds": round(planner.seconds(seg.new_frames), 4),
+    }
+    try:
+        p.store.save(name, video, audio, meta)
+    except Exception as err:   # a full disk mustn't cost the render
+        logger.warning("MiniMax H3 Long Shot: couldn't save %s's take: %s", _shot_label(i), err)
+        p.take_names[i] = None
+
+
+
 def _plain(value):
     """Lazy checks may hand dynamic inputs over as (value, key) pairs; unwrap them."""
     if isinstance(value, dict):
@@ -966,7 +1575,8 @@ def lazy_requests(kwargs, prompt, unique_id):
         p = _prepare(**args, _recipe=recipe, _planning_only=True)
     except Exception:       # let the run itself report the problem
         return wanted
-    return [] if all(s.startswith("reused") for s in p.statuses) else wanted
+    return [] if all(s.startswith("reused") or s.startswith("locked") or s == "clip"
+                     for s in p.statuses) else wanted
 
 
 def _schema_extras(io):
@@ -1097,9 +1707,219 @@ except ImportError:   # ComfyUI too old for the V3 node API
     MiniMaxH3LongShot = None
 
 
+class MiniMaxH3TimelineShot:
+    """A Shot for Long Shot's timeline mode: the same as MiniMax H3 Shot, plus
+    an id, an optional locked take, and how it joins the piece before it.
+
+    Chain these into the Ref Prompt Builder's 'shots' input like Shot nodes.
+    With ids on the chain, Long Shot treats it as a timeline: locked Shots load
+    their take, and a Shot that renders is pinned to the locked Shots on both
+    sides, so you can re-roll a Shot in the middle and keep the ones after it."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "shot_id": ("STRING", {"default": "", "tooltip": "Stable id for this Shot. Its "
+                            "takes are saved as <id>__<seed>__<fingerprint>.safetensors."}),
+                "seconds": ("FLOAT", {"default": 5.0, "min": 0.25, "max": 60.0, "step": 0.01}),
+                "text": ("STRING", {"multiline": True, "default": ""}),
+                "shot_seed": ("INT", {"default": -1, "min": -1, "max": 0xFFFFFFFFFFFFFFFF,
+                              "tooltip": "-1 follows Long Shot's seed. A Shot that has rendered "
+                              "should keep the seed it used, so reordering never changes it."}),
+                "lock": ("STRING", {"default": "", "tooltip": "A take file name from "
+                         "output/longshot/<cache_name>/takes. Locked Shots load the take instead "
+                         "of sampling. Empty: render (or reuse) as usual."}),
+                "join": (["bridge", "cut"], {"default": "bridge", "tooltip": "How this Shot "
+                         "joins the one before it. 'bridge' continues from it; 'cut' starts "
+                         "fresh (an intentional hard cut)."}),
+                "frames": ("INT", {"default": 0, "min": 0, "max": 4096, "tooltip": "Keep this "
+                           "exact window length (17k + 5 frames), e.g. when re-rendering in place. "
+                           "0: from seconds."}),
+            },
+            "optional": {
+                "shots": ("MMH3_SHOTS", {"tooltip": "Chain from the previous Shot node. Leave "
+                          "empty on the first one."}),
+            },
+        }
+
+    RETURN_TYPES = ("MMH3_SHOTS",)
+    RETURN_NAMES = ("shots",)
+    FUNCTION = "add"
+    CATEGORY = "MiniMax H3"
+
+    def add(self, shot_id, seconds, text, shot_seed=-1, lock="", join="bridge", frames=0,
+            shots=None):
+        chain = list(shots) if shots else []
+        if not str(shot_id).strip():
+            logger.warning("MiniMax H3 Timeline Shot %d has no shot_id; it is filed as shot%d, "
+                           "which changes if Shots are inserted before it. Give it an id.",
+                           len(chain) + 1, len(chain) + 1)
+        if frames and not planner.is_valid_frame_count(int(frames)):
+            logger.warning("MiniMax H3 Timeline Shot %d: frames=%d is not 17k + 5; using seconds.",
+                           len(chain) + 1, frames)
+        chain.append({
+            "kind": "shot",
+            "id": str(shot_id).strip() or f"shot{len(chain) + 1}",
+            "seconds": float(seconds),
+            "text": str(text or "").strip(),   # as MiniMax H3 Shot does: same prompt, same fingerprint
+            "cut_verb": "the camera cuts to",
+            "seed": int(shot_seed),
+            "lock": str(lock or "").strip() or None,
+            "join": join,
+            "frames": int(frames) or None,
+        })
+        return (chain,)
+
+
+# ---------------------------------------------------------------------------
+# Clip Shots (round 2, step 3): a real video as a piece of the timeline
+# ---------------------------------------------------------------------------
+
+class MiniMaxH3Clip:
+    """Prepare a video clip for the timeline: resize and centre-crop to the
+    generation size, trim to a 17k + 5 frame length, and encode it with the H3
+    video VAE (and its sound, or silence, with the H3 audio VAE). Frames are
+    expected at 24 fps (VHS Load Video with force_rate 24)."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "images": ("IMAGE", {"tooltip": "The clip's frames at 24 fps."}),
+                "vae": ("VAE", {"tooltip": "H3 video VAE."}),
+                "audio_vae": ("VAE", {"tooltip": "H3 audio VAE."}),
+                "width": ("INT", {"default": 1344, "min": 32, "max": 4096, "step": 32}),
+                "height": ("INT", {"default": 768, "min": 32, "max": 4096, "step": 32}),
+                "frames": ("INT", {"default": 0, "min": 0, "max": 100000, "tooltip": "Use this many "
+                           "frames (snapped down to 17k + 5). 0: as many as the clip has."}),
+                "audio_mode": (["clip", "mute"], {"default": "clip", "tooltip": "The clip's own "
+                               "sound, or silence."}),
+            },
+            "optional": {"audio": ("AUDIO", {"tooltip": "The clip's sound (VHS Load Video's audio)."})},
+        }
+
+    RETURN_TYPES = ("MMH3_CLIP",)
+    RETURN_NAMES = ("clip",)
+    FUNCTION = "prepare"
+    CATEGORY = "MiniMax H3"
+
+    def prepare(self, images, vae, audio_vae, width, height, frames=0, audio_mode="clip", audio=None):
+        h3, _ = _native()
+        if width % 32 or height % 32:
+            raise ValueError("width and height must be multiples of 32")
+        have = int(images.shape[0])
+        want = min(have, int(frames)) if frames else have
+        n = planner.nearest_valid(want)
+        while n > want and n > 5:
+            n -= planner.GROUP_FRAMES
+        if n < 5 or n > have:
+            raise ValueError(f"The clip has {have} frames; it needs at least 5 at 24 fps.")
+        pixels = h3._resize(images[:n], width, height, "center")
+        video = vae.encode(pixels)
+        if video.shape[2] != planner.video_tokens(n):
+            raise RuntimeError(f"The video VAE returned {video.shape[2]} tokens for {n} frames; "
+                               f"expected {planner.video_tokens(n)}.")
+        need = planner.audio_at(n)
+        sr = getattr(audio_vae, "audio_sample_rate", 32000)
+        if audio_mode == "clip" and audio is not None:
+            a, _ = h3._encode_ref_audio(audio_vae, audio)
+        else:
+            a = None
+        if a is None or a.shape[-1] < need - 2:
+            # silence for a muted clip, and to pad a clip whose sound is short
+            silent, _ = h3._encode_ref_audio(audio_vae, {
+                "waveform": torch.zeros(1, 2, int(round(n / planner.FPS * sr)) + sr // 10),
+                "sample_rate": sr})
+            a = silent if a is None else torch.cat([a, silent[..., a.shape[-1]:]], -1)
+        audio_lat = _fit_audio(a[..., :need + 2], need) if a.shape[-1] >= need else _fit_audio(a, need)
+        clip = {"video": video.detach().cpu(), "audio": audio_lat.detach().cpu(), "frames": n,
+                "width": width, "height": height,
+                "pixels": pixels.detach().cpu().to(torch.float16)}
+        src_audio = audio["waveform"] if (audio_mode == "clip" and audio is not None) else None
+        clip["digest"] = _digest(["clip", clip["pixels"], src_audio, audio_mode, n, width, height])
+        return (clip,)
+
+
+class MiniMaxH3ClipShot:
+    """Put a prepared clip into the Shot chain, like a Shot. It is never
+    sampled; the Shots next to it lead into it or out of it ('bridge'), or
+    meet it with a hard cut ('cut')."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "clip": ("MMH3_CLIP",),
+                "shot_id": ("STRING", {"default": ""}),
+                "join": (["bridge", "cut"], {"default": "bridge", "tooltip": "How the clip joins "
+                         "the piece before it."}),
+            },
+            "optional": {"shots": ("MMH3_SHOTS",)},
+        }
+
+    RETURN_TYPES = ("MMH3_SHOTS",)
+    RETURN_NAMES = ("shots",)
+    FUNCTION = "add"
+    CATEGORY = "MiniMax H3"
+
+    def add(self, clip, shot_id, join="bridge", shots=None):
+        chain = list(shots) if shots else []
+        chain.append({
+            "kind": "clip",
+            "id": str(shot_id).strip() or f"clip{len(chain) + 1}",
+            "seconds": clip["frames"] / planner.FPS,
+            "text": "",
+            "cut_verb": "the camera cuts to",
+            "seed": 0,
+            "lock": None,
+            "join": join,
+            "frames": clip["frames"],
+            "clip": clip,
+        })
+        return (chain,)
+
+
+class MiniMaxH3ClipPixels:
+    """Final video option: put each clip's original (resized) frames back in
+    place of their decoded version. Sharper clips; a faint seam can show where
+    a clip meets generated footage."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {
+            "images": ("IMAGE", {"tooltip": "VAE Decode of Long Shot's latent."}),
+            "latent": ("LATENT", {"tooltip": "Long Shot's latent (it carries where the clips are)."}),
+            "enabled": ("BOOLEAN", {"default": True}),
+        }}
+
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("images",)
+    FUNCTION = "swap"
+    CATEGORY = "MiniMax H3"
+
+    def swap(self, images, latent, enabled=True):
+        spans = (latent or {}).get("mmh3_clips") or []
+        if not enabled or not spans:
+            return (images,)
+        out = images.clone()
+        for sp in spans:
+            px = sp["pixels"][sp["offset"]:sp["offset"] + sp["frames"]]
+            a = sp["start"]
+            b = min(out.shape[0], a + px.shape[0])
+            if b <= a or px.shape[1:3] != out.shape[1:3]:
+                continue
+            out[a:b] = px[:b - a].to(out)
+        return (out,)
+
+
 NODE_CLASS_MAPPINGS = {
     "MiniMaxH3SongTrack": MiniMaxH3SongTrack,
     "MiniMaxH3RefModCarrier": MiniMaxH3RefModCarrier,
+    "MiniMaxH3TimelineShot": MiniMaxH3TimelineShot,
+    "MiniMaxH3Clip": MiniMaxH3Clip,
+    "MiniMaxH3ClipShot": MiniMaxH3ClipShot,
+    "MiniMaxH3ClipPixels": MiniMaxH3ClipPixels,
 }
 if MiniMaxH3LongShot is not None:
     NODE_CLASS_MAPPINGS["MiniMaxH3LongShot"] = MiniMaxH3LongShot
@@ -1109,4 +1929,8 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "MiniMaxH3LongShot": "MiniMax H3 Long Shot",
     "MiniMaxH3SongTrack": "MiniMax H3 Song Track",
     "MiniMaxH3RefModCarrier": "MiniMax H3 RefMod Carrier",
+    "MiniMaxH3TimelineShot": "MiniMax H3 Timeline Shot",
+    "MiniMaxH3Clip": "MiniMax H3 Clip",
+    "MiniMaxH3ClipShot": "MiniMax H3 Clip Shot",
+    "MiniMaxH3ClipPixels": "MiniMax H3 Clip Pixels",
 }
