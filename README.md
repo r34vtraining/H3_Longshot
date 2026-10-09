@@ -1,401 +1,459 @@
-# ComfyUI — MiniMax H3 Long Shot
+# H3 Long Shot Studio
 
-Render one continuous shot longer than a single H3 generation. Each **Shot**
-node in a chain becomes one generation; they're stitched in latent space and
-decoded once, so the joins are seamless. Optional lip sync to a song.
+## What's new in 0.5.0
 
-A single Shot works too: it's one ordinary generation with nothing to stitch, so
-the same workflow covers any length.
+Needs H3 Long Shot **1.5.0 or later**. Replace both folders, restart ComfyUI, then
+hard-refresh the Studio tab.
 
-Requires the [H3 Prompt Compiler](https://github.com/r34vtraining/H3_Prompt_Compiler) pack (for the Shot and Ref Prompt
-Builder r2v nodes) and a ComfyUI build with native MiniMax H3, arbitrary-frame
-guides, and the V3 node API.
+**Clip Shots and joins**
+- **Clip Shots:** add a real video clip as a Shot, or replace a Shot with one
+  ("Replace with clip"). The Shots on either side render into and out of it; click the
+  join marker to make it a hard cut instead. Two clips side by side always cut.
+  An Advanced switch swaps the clip's original frames back in after upscaling.
+- **Bridge button** on the "↯ hard cut" flag re-renders the next Shot so it flows on
+  from the one before.
+
+**Re-rolling and building Shot by Shot**
+- **Reroll in place:** reroll any approved Shot, pinned at both ends, so the Shots
+  around it stay exactly as they are.
+- **Add Shots anywhere**, including before Shot 1 ("Shot before" / "Shot after").
+- **Take history** per Shot: step through earlier takes, switch instantly, delete ones
+  you don't want.
+- Approved Shots are locked to their take and seed, so they never re-render by accident.
+- Every join is checked; a broken one is flagged "↯ hard cut" and left for you to
+  reroll or bridge.
+- Segments saved by older versions are picked up automatically.
+
+**Layout**
+- **Top bar** shows RAM, GPU use and VRAM.
+- **Settings:** seed moved to the top; model selection, Turbo and LoRAs moved into
+  Advanced (under "Sampling").
+- **Decision row** split 25 / 50 / 25: Approve | Approve & render next | Reroll.
+
+**Models**
+- **Browse…** on every model field (MelBand included).
+- Add your own model folders (on the ComfyUI machine only).
+- Model names are matched across machines, so a project made on another PC finds
+  your copies.
+
+**Projects and files**
+- **Rename** moves the project's input and takes folders too.
+- **Missing references relink themselves** when you copy the file into the project's
+  input folder: identical contents relink silently, a same-name file asks first.
+- **Drag-and-drop audio upload.**
+- **Export / Import** a project as one .zip (references, audio, clips and takes;
+  "Include takes" is on by default). Works on the ComfyUI machine only.
+
+**Housekeeping**
+- Generic README with a git clone install; the example project was replaced by a
+  neutral test fixture.
 
 ---
+
+A browser front end for [MiniMax H3 Long Shot](https://github.com/r34vtraining/H3_Longshot),
+served by ComfyUI itself at **http://127.0.0.1:8188/longshot** (or whatever address your
+ComfyUI uses). You build a continuous long shot one approved Shot at a time:
+
+- **▶ Render Shot 1** starts. A one-Shot project works the same way.
+- **✓ Continue** approves the Shot under review and renders the next one.
+  Approved Shots load their saved take, so each step costs one Shot.
+- **⟳ Reroll** gives the Shot under review a new seed and renders it again.
+- **Stop** interrupts. Finished segments are kept, so the next render picks up from there.
+
+The pack adds no nodes. It builds a workflow from your project (with H3 Long Shot's
+Timeline Shot nodes) and queues it on ComfyUI.
+
+**Features**
+- Projects with autosave, a project menu, two-tab protection, renaming that moves the
+  project's folders, and export / import as one .zip.
+- Cast & Scenes references with drag and drop, a label/description editor and a lightbox.
+- Shot-by-shot review: approve, or reroll any Shot **in place**, pinned to the Shots
+  around it so they stay exactly as they are.
+- Add Shots anywhere, including before Shot 1; take history per Shot, with instant
+  switching; hard cuts are flagged, with a one-click Bridge.
+- **Clip Shots:** real video clips in the timeline, with the Shots around them
+  bridged into and out of them (or a hard cut).
+- Every take saved on disk, so a crash or restart costs no finished Shots.
+- A viewer with frame stepping, loop-the-seam, theater and full-screen views, and volume.
+- Audio routes (lip sync, voice reference, song in the final video) with a clip preview.
+- Optional RTX Video Super Resolution for previews or the final video.
+- RAM / GPU / VRAM in the top bar, and Restart ComfyUI from the page.
+
+## Requirements
+
+- A ComfyUI version with native MiniMax H3 support, and the MiniMax H3 model files.
+- These custom node packs. The Studio checks for them and names any that are missing.
+
+| Pack | Needed for |
+|---|---|
+| [H3 Prompt Compiler](https://github.com/r34vtraining/H3_Prompt_Compiler) | Shot, Subject, Ref Prompt Builder r2v (always) |
+| [H3 Long Shot](https://github.com/r34vtraining/H3_Longshot) **1.5.0 or later** | rendering; adds the timeline mode (takes, locks, pins) and Clip Shots the Studio uses (always) |
+| [ComfyUI-KJNodes](https://github.com/kijai/ComfyUI-KJNodes) | resizing references, optional Sage attention (always) |
+| [ComfyUI-VideoHelperSuite](https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite) | saving the video, loading audio (always) |
+| [ComfyUI-MiniMax-H3-Turbo](https://github.com/Larryvrh/ComfyUI-MiniMax-H3-Turbo) | only when Turbo is on |
+| [ComfyUI-MelBandRoFormer](https://github.com/kijai/ComfyUI-MelBandRoFormer) | only for the voice-reference audio route |
+| [ComfyUI-NVIDIA-RTX-VSR-Pro](https://github.com/whmc76/ComfyUI-NVIDIA-RTX-VSR-Pro) | only for RTX upscaling (needs an RTX GPU) |
+
+The default scheduler, `beta57`, comes from [RES4LYF](https://github.com/ClownsharkBatwing/RES4LYF).
+If you don't have it, pick another scheduler under **Advanced**.
 
 ## Install
 
 ```bash
 cd ComfyUI/custom_nodes
+git clone https://github.com/r34vtraining/H3_Longshot_Studio
 git clone https://github.com/r34vtraining/H3_Prompt_Compiler
 git clone https://github.com/r34vtraining/H3_Longshot
+git clone https://github.com/kijai/ComfyUI-KJNodes
+git clone https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite
 ```
 
-Restart ComfyUI. No extra dependencies (`safetensors` ships with ComfyUI). Three nodes appear under **MiniMax H3**: Long Shot, Song Track, and RefMod Carrier.
+Skip any you already have. If you already have H3 Long Shot, update it to 1.5.0 or
+later with `git pull` in its folder.
 
-**Updating from an earlier version.** The new widgets (`save_to_disk`, `cache_name`)
-come after the existing ones, so saved workflows keep their values. If your saved
-Long Shot shows `max` in `reuse_segments` (from the older widget shift), set it back
-to on and `ref_image_size` to your choice.
+Optional packs:
 
----
-
-## Wiring
-
-```
-Shot ─→ Shot ─→ Shot ─→ [shots] Ref Prompt Builder r2v ─→ long_shot ─→ [prompt] MiniMax H3 Long Shot ─→ latent ─→ VAE Decode
-                                                                         ↑ model, clip, vae               └→ VAE Decode Audio
-                                                                         ↑ noise, sampler, sigmas
+```bash
+git clone https://github.com/Larryvrh/ComfyUI-MiniMax-H3-Turbo      # Turbo LoRA
+git clone https://github.com/kijai/ComfyUI-MelBandRoFormer          # voice-reference route
+git clone https://github.com/whmc76/ComfyUI-NVIDIA-RTX-VSR-Pro      # RTX upscaling
 ```
 
-- **model / clip / vae** — your usual H3 loaders. Apply `ModelSamplingMiniMaxH3`
-  to the model as you normally would.
-- **noise / sampler / sigmas** — `RandomNoise`, `KSamplerSelect`,
-  `BasicScheduler`. The reference setting is euler / beta / 20 steps.
-- **prompt** — the `long_shot` output of **MiniMax H3 Ref Prompt Builder r2v**,
-  with your Shot chain wired into the builder's `shots` input. Each Shot is one
-  segment: its `text` is that segment's prompt and its `seconds` is its length.
-  `cut_verb` is ignored — this is one continuous shot.
+KJNodes, VideoHelperSuite and some optional packs have Python requirements. Install
+them with ComfyUI's Python from each pack's folder:
 
-Everything else on the builder applies to every segment: subject definitions,
-task types, summary, retention analysis, style line, soundscape, and music.
-Because each segment is its own one-shot generation, any `[Shot N]` mentioned
-in those sections becomes `[Shot 1]` — so `(appears in [Shot 1], [Shot 3])`
-becomes `(appears in [Shot 1])`. The builder's own `prompt` output still shows
-the whole sequence as one prompt, for reference.
-
-With no references connected at all, Long Shot writes each segment in the base
-format instead, and only the builder's style line, soundscape, and music apply.
-
-Decode the output **in a single pass** with the native decoders. That single
-decode is what makes the joins invisible.
-
-### The settings that matter
-
-**overlap_frames** — hidden context shared across each join (5, 22, 39, 56…).
-22 is the proven default. More carries motion better but re-samples more.
-
-**style_line** (on the builder) — restated at the start of every segment. Put
-your look here, not in the first Shot, or later segments drift.
-
-**reuse_segments** — on by default. Reuses segments that would come out
-identical, so a re-run only renders what changed. See *Re-rolling and building
-Shot by Shot* below.
-
-**save_to_disk** / **cache_name** — on by default. Finished segments are also
-saved to disk, so a crash or restart doesn't cost finished Shots. See *Saved
-segments* below.
-
-**dry_run** — outputs the full plan and every segment's prompt in a second,
-without sampling. Each segment costs minutes; check the plan first. Wire the
-`plan` output to a text preview node. The `latent` output is blocked during a
-dry run, so everything wired after it — decoders, upscalers, video saves — is
-skipped instead of producing an empty clip.
-
----
-
-## Lip sync to a song
-
-```
-Load Audio (trimmed) ─┬─→ MiniMax H3 Song Track ─→ song ─→ [song] Long Shot
-                      │       ↑ audio_vae
-                      └─→ (mux onto the final video)
+```bash
+python -m pip install -r requirements.txt
 ```
 
-**Use Song Track for lip sync, not `ref_audio`.** A `ref_audio` input is a
-reference — every segment receives the whole clip as guidance for how voices
-or music should sound, with no position on the timeline. That's right for a
-voice timbre. Song Track instead gives each segment only its own slice of the
-song, pinned to that segment's frames, which is what keeps the mouth in step
-with the song across a long chain.
+For the Windows portable build, run this from the `ComfyUI_windows_portable` folder instead:
 
-Trim the song in your audio loader, to start where the video starts. Song Track
-encodes it **once**, as-is. The clip only needs to cover the Shots' total
-length; Long Shot tells you if it falls short. Long Shot then gives each segment its exact slice of that encoding,
-pinned to the segment's timeline — the mechanism H3 uses for lip sync.
-
-What happens under the hood:
-
-- With a song connected, the song is the only source of audio. The continuation
-  guide carries video only, so two audio guides never compete over the same frames.
-- The song is sliced as **latents**, not waveform. Cutting and encoding the
-  waveform per segment would add edge artifacts at every join.
-- The output latent's audio is replaced by the song itself, token for token.
-  For the cleanest result, mux the loader's trimmed audio onto the decoded
-  video instead of using the decoded audio.
-
-### Writing the lyrics
-
-Each Shot needs the lyrics sung **during its window** in `<d>` tags. The plan
-output tells you exactly which part of the song each Shot covers:
-
-```
-Segment 2: asked 6.5s, got 6.38s · shows 00:07.3–00:13.7 · window 175f (22f hidden overlap)
-  lyrics for this Shot: song 00:06.4–00:13.7 (includes 0.92s overlap)
+```bat
+python_embeded\python.exe -m pip install -r ComfyUI\custom_nodes\ComfyUI-KJNodes\requirements.txt
 ```
 
-The range includes the hidden overlap, because the pinned audio spans the
-whole window — so the text should too. Times count from the start of the
-clip Song Track receives, so add your loader's start time to find the same
-spot in the full song.
+The Studio itself has no extra dependencies.
 
----
+Restart ComfyUI and open **http://127.0.0.1:8188/longshot**.
 
-## Re-rolling and building Shot by Shot
+## Getting started
 
-Long Shot remembers every segment it renders. On the next run, any segment that
-would come out identical is reused instead of sampled, so only the Shots you
-changed, and the ones after them, render again.
+1. The first time you open the Studio it makes an empty **Untitled** project. Rename it
+   from the project menu (click the name at the top).
+2. In **Settings**, check the model, text encoder, VAEs and Turbo LoRA. The Studio
+   fills any it can identify from your model folders; choose the rest yourself.
+3. Drop reference images on **Cast & Scenes** and give each a label (for example
+   `<hero>`, `<scene1>`) and a short description.
+4. Fill in **Style & Sound**, then write your Shots, referring to references by label.
+5. Press **▶ Render Shot 1**, review it, then **✓ Continue** or **⟳ Reroll**.
 
-- **Build it up a Shot at a time.** Render Shots 1–2. Add Shot 3 and queue:
-  Shots 1–2 are reused and only Shot 3 renders. A segment depends only on the
-  segments before it, never on how many come after.
-- **Re-roll one Shot.** Set that Shot's `shot_seed` (on the Shot node) to any number.
-  `-1` follows Long Shot's seed: base + Shot number − 1 with `seed_mode`
-  increment. Only that Shot and the ones after it render again.
-- **Change a middle Shot** and it renders, along with every Shot after it,
-  since they continue from its ending.
-- **Interrupted?** Queue again. The segments that finished are kept.
+Updating: run `git pull` in the Studio's folder (and in H3 Long Shot's), then restart
+ComfyUI and hard-refresh the page (Ctrl+Shift+R).
 
-Set **RandomNoise** to *fixed* (its control after generate). On *randomize*,
-the base seed changes every queue and nothing can be reused.
+## How it works
 
-Each segment line in the plan says what will happen, dry run included:
+- `POST /longshot/build` turns the project into a ComfyUI API prompt (`graph_builder.py`,
+  pure Python). Each render queues the chain of active Shots up to the target. Long Shot reuses every
+  unchanged earlier segment and samples only what changed.
+- The browser queues that prompt through ComfyUI's own `/prompt`, follows progress on `/ws`
+  (including Long Shot's per-segment `mmh3.longshot` events), and reads the plan and the video
+  from `/history`.
+- Projects are saved as `ComfyUI/user/default/longshot-studio/projects/<slug>.json` (see *Projects*).
+- Videos are saved to `ComfyUI/output/longshot/<project>_00001.mp4`. Video Combine uses NVENC
+  when your ffmpeg can actually run it (checked with a one-frame test encode), and the
+  software h264 encoder otherwise.
+- The size uses the same rule as ComfyUI's ResolutionSelector and MiniMax's size table
+  (1 MP = 1024 × 1024 px, multiples of 32). For example, 0.6 MP at 16:9 gives 1056 × 608.
+- Model names saved on Windows (`H3\x`) still match on Linux (`H3/x`), and the other way round.
 
-```
-Segment 4: asked 5s, got 4.96s · … · seed 1683 · reused (disk)
-Segment 5: asked 9s, got 9.04s · … · seed 1684 · reused (memory)
-Segment 6: asked 7s, got 7.04s · … · seed 77 (Shot seed) · will render — seed changed
-```
+### Layout
 
-The reasons: *prompt changed*, *seed changed*, *length changed*, *references
-changed*, *song changed*, *model, CLIP or VAE changed* (a new LoRA, a reloaded
-model), *sampler, sigmas or size changed*, *follows a changed segment*, or
-*first run*.
+- **Top bar:** the project menu, then **RAM / GPU / VRAM** of the ComfyUI machine
+  (refreshed every 2 s; amber above 90%; GPU load needs an NVIDIA driver),
+  **Restart** and the connection light.
+- **Decision row** under the viewer: **✓ Approve** (25%), the main action (50%) and
+  **⟳ Reroll** (25%). Approve only approves. The main button is **✓ Approve & render
+  Shot N**; with nothing left to render it becomes **Update preview** or **Upscale
+  final**. Before anything is under review, Approve and Reroll are greyed out.
+- **Settings** starts with **Seed · fixed**, then steps, size, RTX, reference size and
+  the saved takes. **Advanced** holds the model files, Turbo and the LoRAs, then the
+  sampling options. If a model file is missing, rendering stops, opens Advanced and
+  marks the field.
 
-Segments are kept in RAM until ComfyUI restarts, up to the 64 most recent, and
-on disk (below). Turn `reuse_segments` off to render everything fresh and store
-nothing.
+### Model files
 
----
+Advanced shows the **Model**, **Text encoder**, **Video VAE** and **Audio VAE** at the
+top, each with **Browse…** (so do the Turbo LoRA, the LoRAs, and the vocal separation
+model when Voice reference is on).
 
-## Saved segments (crash-proof resume)
+- **Browse…** lists every file ComfyUI can see for that slot, with a search box, the
+  subfolder and size of each file, and the folders ComfyUI looks in.
+- **Add a folder…** (from the machine running ComfyUI) picks a folder anywhere on
+  that machine. ComfyUI lists its files straight away, no restart needed, and the
+  Studio adds it again every time ComfyUI starts. The list is kept in
+  `ComfyUI/user/default/longshot-studio/model_folders.json`. Folders added here can be
+  removed here; folders from ComfyUI's `extra_model_paths.yaml` stay as they are.
+- **Projects move between machines.** A model saved as `H3\model.safetensors` is found
+  as `model.safetensors` (or in any other subfolder) on a machine that keeps it
+  elsewhere, as long as only one file has that name. If a file can't be found, the
+  field shows *(missing)* and rendering stops with a message naming it.
 
-Every finished segment is also written to
+### Projects
 
-```
-ComfyUI/output/longshot/<cache_name>/segments/<fingerprint>.safetensors
-```
+- **Rename** moves the project's folders with it: `input/longshot/<slug>` and
+  `output/longshot/<slug>` (takes) take the new name, and every reference is updated,
+  so nothing re-renders. It waits until ComfyUI's queue is empty, and never merges
+  into a folder that already exists (it picks `name-2`).
+- **Export…** (Project menu, on the ComfyUI machine) saves one `.zip` with the
+  project and every file it uses: reference images, the song and video clips.
+  **Include takes** is on by default, so approved Shots open already rendered with
+  their take history; the last preview video is optional. Model files aren't included.
+- **Import…** (or drop the `.zip` anywhere on the page) makes a new project: files go
+  into its own folders and every reference is relinked. It never overwrites a project.
 
-When you queue again, after a crash, a restart or days later, Long Shot looks in RAM,
-then on disk, and only samples what's in neither. You never point at a file;
-just queue again.
+- **Slug.** Each project has a fixed slug: its name lower-cased, with other characters
+  turned into `-` (for example `my-chase-scene` for "My chase scene"). Names with no Latin letters or
+  digits get `project-<hash>`. **Rename** changes only the display name, so the
+  project's takes (`output/longshot/<slug>/takes`) and input folder
+  (`input/longshot/<slug>`) stay attached.
+- **Menu.** Click the project name for **New project**, **Open…** (with the last
+  video's first frame, the save time and progress), **Save** (Ctrl/⌘ S), **Save as…**,
+  **Rename…**, **Duplicate** and **Delete…**. Delete can also remove the saved takes
+  and the input folder; both are unticked by default, and both only work from the
+  ComfyUI machine.
+- **Autosave.** The project saves 2 s after any change, and right away when a render is
+  queued or finishes. The indicator shows "Saved · 21:34", "Saving…" or
+  "Unsaved changes". The last project reopens on load.
+- **Two tabs.** If another tab saved the project since this one loaded it, saving stops
+  and asks **Reload** or **Keep mine**.
 
-| reuse_segments | save_to_disk | Behaviour |
-|---|---|---|
-| on | on (default) | memory + disk |
-| on | off | memory only |
-| off | — | nothing is reused or stored |
+### References and audio
 
-- **cache_name** names the folder (letters, digits, `. _ -`; anything else becomes `_`).
-  Use one per project. H3 Long Shot Studio sets it to the project's slug.
-- **Files.** Each file holds the segment's video and audio latents in fp16 (cast back
-  on load), plus metadata: segment, seconds, seed, shapes, Long Shot version and
-  creation time. That's about 1 MB per second of video at 0.6 MP and about 1.5 MB/s at
-  0.9 MP. Delete the folder whenever you like.
-- **Safe writes.** Writes go to a `.tmp` file first and are renamed when complete, so a
-  crash mid-write never leaves a file that looks valid. Leftover `.tmp` files are
-  removed on the next run. A damaged or wrong-shape file is ignored, and that
-  segment renders again.
+- **What's saved.** Each reference saves its file name and subfolder (as ComfyUI has
+  them), the file's size and sha256, and its original name. Audio saves the same, plus
+  start, length and the three routes.
+- **Where files can come from.** The file pickers list this project's input folder
+  (`input/longshot/<slug>`) first, then the input folder itself.
+- **Reopen checks.** On opening, every file is checked inside the input folder:
+  - **ok**: shown normally.
+  - **Changed since saved**: amber badge. The file was overwritten, so every Shot
+    renders again.
+  - **Missing**: red placeholder with **Relink…** and **Bypass**. Rendering waits until
+    every active reference is found or bypassed. A missing song turns off only the
+    audio routes for that render.
+- **Missing files find themselves.** Copy a missing file back into the project's
+  input folder (or the input folder) and switch back to the page: the Studio relinks
+  it. The same contents under any name relink silently, with nothing to re-render;
+  a file that only has the same name asks first, since every Shot would re-render.
+- **Relinking costs nothing.** Picking a file with the same contents, even from another
+  folder, restores it silently with nothing to re-render.
+- **Drag and drop.** Drop images on **Add reference** (or anywhere in Cast & Scenes) to
+  add one reference per image. A single new image opens the editor so you can name it.
+  Drop an image on a card to replace that card's picture. Clicking an empty thumbnail
+  opens a file picker.
+  - Files go to `input/longshot/<slug>/` through `POST /longshot/upload`, from any device
+    that can reach ComfyUI. The size limit is ComfyUI's `--max-upload-size`.
+  - Uploads never overwrite. A file with the same contents is reused, so dropping the
+    same picture again re-renders nothing. A different picture with an existing name
+    is saved as `name (2).png`.
+  - Only images are taken (PNG, JPG, WebP, BMP, GIF, TIFF), and each is checked as a
+    readable image.
+- **Audio upload.** Drop a song anywhere on the Audio panel (even closed), or use
+  **Upload…** next to the file list. It goes into the project's input folder and
+  becomes the project's audio.
+- **Audio preview.** The play button next to Length plays the clip the render will use:
+  from Start, for Length seconds (0 plays to the end). It plays at the viewer's volume
+  level, stops by itself at the end of the clip, and stops when the video plays.
+- **Subfolders work for audio.** `VHS_LoadAudioUpload` validates the file by path, not
+  by its dropdown, so `input/longshot/<slug>/song.mp3` loads. Images and audio in a
+  project subfolder are tested through ComfyUI's validator and executor
+  (`test_references_and_audio_load_from_a_project_subfolder`).
 
-### What makes a segment "the same" after a restart
+### Takes
 
-The in-memory check identifies the model by object identity, which no restart
-survives. For disk, Long Shot fingerprints the **recipe** instead:
+Every Shot you render is kept as a **take**: a file in
+`output/longshot/<slug>/takes/` named `<shot>__<seed>__<id>.safetensors` (about
+4–5 MB for a 5 s Shot at 0.6 MP). Approved Shots, and the Shot under review, load
+their take instead of sampling.
 
-- It follows its `model`, `clip`, `vae`, `audio_vae`, `sampler` and `sigmas` wires
-  upstream through the workflow and hashes every node's class and settings. That
-  includes model file names, LoRA strengths, shifts, Sage settings, scheduler and steps.
-- Node ids aren't part of it, so a rebuilt or renumbered graph matches.
-- Each model file's **size and modified time** go in with its name. Replacing a file
-  under the same name counts as a change; moving your models to another drive costs
-  one re-render.
-- Seeds, prompts, lengths, references (by content), the song slice and first/last
-  frames were already restart-proof.
+- **Crash or restart?** Reopen the project. A free dry run (the model doesn't load)
+  shows every finished Shot as **take** in the Plan, and Continue picks up where you
+  left off.
+- **Projects from earlier versions** keep their saved segments: the first render
+  adopts them as takes, so nothing re-renders.
+- Settings shows **Saved takes: N files · X MB** and **Delete all takes** (from the
+  ComfyUI machine only).
 
-If a run comes from outside ComfyUI's executor (no workflow to read), segments stay
-in memory only, and the log says so.
+### Reviewing and rerolling
 
-### The model only loads when something renders
+- **Seed · fixed** (Settings) feeds every Shot left on auto. A Shot's seed is frozen
+  the first time it renders, so adding or moving Shots never changes it; changing the
+  base seed only affects Shots that haven't rendered yet.
+- **Reroll in place.** ⟳ on an approved Shot gives it a new take with the same length,
+  pinned to the Shot before it and to the Shots after it, which stay exactly as they
+  are. One render.
+  - The dialog has **Also re-render the Shots after it** for when the change should
+    ripple: those Shots go back to Queued, keep their text and seeds, and are marked
+    "was ✓"; **Re-render through Shot N** then brings them back in one queue.
+  - Editing a rendered Shot's text, seconds or seed also re-renders it in place; the
+    toast offers to re-render the Shots after it too.
+- **Take history.** A Shot with more than one take shows **Take 2 of 4 ◀ ▶** beside
+  Reroll (and in its card). Switching takes is instant: the take is a file, so only
+  the preview is rebuilt. Click the label for every take, to use one or delete
+  ones you don't need (deleting works from the ComfyUI machine only).
+- **Add Shots anywhere.** **Add shot before Shot 1** sits above the list, and an open
+  Shot card has **⊕ Shot before** / **⊕ Shot after**. A new Shot renders once, pinned
+  to the Shots around it; everything else keeps its take.
+- **Hard cuts.** If a Shot no longer follows the take before it (say you removed or
+  bypassed the Shot in between), its card shows **↯ hard cut** and a **Bridge**
+  button, and the Plan says so. Bridge re-renders that Shot in place so it flows
+  from the Shot now before it, keeping the Shots after it. After removing, bypassing or switching takes,
+  **▶ Update preview** rebuilds the video without sampling anything.
+- **Lip sync.** Anything that moves later Shots against the song (inserting, removing,
+  bypassing, changing a Shot's length) re-renders those Shots so they stay in sync.
+- **References** open in an editor dialog when you click the label, the description or
+  ✎. It shows the image large, the label, and an auto-growing description box.
+  - Ctrl/⌘ Enter saves and Esc cancels.
+  - Clicking outside asks before discarding your edits.
+  - Saving asks first when rendered Shots would re-render.
+- **Clicking a thumbnail** opens the lightbox: scroll to zoom, drag to pan, ←/→ to move
+  between references, Esc to close.
+- **Bigger viewer.**
+  - **Theater** (▭ button or `T`) spans the page, with the decision panel beside it.
+  - **Full screen** (⛶ button or `F`) puts the video, every control and the decision panel
+    on screen, with the controls in a translucent bar along the bottom that sits in the
+    letterbox space first.
+  - Esc or the same button exits. Space and ←/→ (frame step) work in every view.
+- **Volume.** The speaker button mutes and unmutes, the slider sets the level, and `M`
+  toggles mute. Both are in every view, and the browser remembers the level and mute
+  state between sessions.
 
-`model`, `clip`, `vae`, `audio_vae` and `sigmas` are *lazy* inputs. Long Shot works
-out the plan first and asks ComfyUI to load them only if a segment actually needs
-sampling. A dry run, or a re-run where every segment comes from memory or disk,
-never loads the model. After a restart you can re-decode or check a finished
-chain in seconds.
+### Clip Shots
 
----
+A Shot can be a real video clip instead of a prompt: footage, a stock clip, or
+anything rendered elsewhere. The generated Shots around it lead into and out of it.
 
-## Timing
+- **Adding one:** drop a video on the Shots list (it goes after the Shot you drop it
+  on), **⊕ Clip after** or **Replace with clip** in an open Shot, or **＋ Clip before
+  Shot 1**. Replace keeps the old Shot, bypassed, so you can switch back, and matches
+  its length.
+- **The card** shows a filmstrip, the video (pick another or **Upload…**), **Start**
+  and **Length** (snapped to a valid length; it shows the result), and **Sound**: the
+  clip's own or mute. Clips are resized and centre-cropped to the film's size, at 24 fps.
+- **Joins:** the marker between a clip and its neighbour is **Bridge ↔** (the generated
+  Shot re-renders to flow into or out of the clip; the default) or **Cut |** (it stays
+  as it is: a hard cut). Click it to switch. Two clips together always cut.
+- **What re-renders:** adding a clip, or changing its trim, length, sound or file,
+  re-renders only the bridged Shots next to it. Replacing Shot 4 of 6 re-renders
+  Shots 3 and 5; the rest keep their takes.
+- **The shared zone:** each join shares 0.92 s (at the default overlap): on a bridge
+  the Shot before the clip arrives there; on a cut those first 0.92 s of the clip are
+  hidden. The card says which.
+- **Final video:** Settings → **Final video: original clip pixels** puts each clip's
+  original frames back when you **Upscale final video** (sharper clips, possible faint
+  seam at their edges). Otherwise clips come out of the decoder like everything else.
+- The viewer marks clip spans in blue. Clip files are listed and relinked like other
+  references, and travel with exports.
+- ComfyUI's upload limit (`--max-upload-size`, 100 MB by default) applies to dropped
+  videos; for bigger files, copy them into the project's input folder and pick them
+  on the card.
 
-H3 moves in 17-frame steps (~0.7s), so durations snap to the grid. Long Shot
-snaps each segment's **end point** on the global timeline rather than its
-length. Rounding therefore never accumulates: every boundary lands within
-~0.35s of where you put it, however many segments you chain. This is what
-keeps a long music video in step with its song.
+### RTX Super Resolution (upscale previews / upscale final)
 
-H3 is trained on windows of roughly 124–362 frames (5–15s). The plan flags any
-segment outside that range.
+Two controls use NVIDIA's RTX Video Super Resolution node (`RTXVideoSuperResolution`,
+"scale by multiplier"), which runs between VAE Decode and Video Combine. Neither ever re-renders a Shot: the upscale runs after Long Shot,
+so segments are reused and only the decode, upscale and save run again.
 
----
+- **Upscale previews** (switch in Settings, under the resolution settings). When it's
+  on, every render is upscaled. It gets slower as the chain grows, so leave it off
+  while you review.
+- **⤢ Upscale final video** (decision panel, once every Shot is approved). It always
+  upscales, with the scale and quality set next to the switch, and saves as
+  `longshot/<project>_final_#####.mp4`. After that, the panel shows the saved file
+  name and offers "again".
+- **Scale** is 1.5× or 2×. Higher factors mostly run out of memory on long chains.
+- **RAM.** ComfyUI holds every frame in system RAM as float32, before and after the
+  upscale. A 35 s chain at 0.6 MP needs about 20 GB at 1.5× and 30 GB at 2×. The
+  Settings row shows the estimate for your current chain.
+- **Needs** ComfyUI-NVIDIA-RTX-VSR-Pro and an RTX GPU. Without the pack, both controls are
+  greyed out.
 
-## References
+### Restarting ComfyUI
 
-Long Shot has the same growing reference inputs as the native **MiniMax H3
-Reference to Video** node — connect one and the next slot appears:
+**Restart** (top bar, left of the status light) restarts ComfyUI after asking first.
 
-| Inputs | Up to | Label |
-|---|---|---|
-| `ref_image_0`, `ref_image_1`… | 9 | `<Picture 1>`, `<Picture 2>`… |
-| `ref_video_0`… | 3 | `<Video 1>`… |
-| `ref_video_audio_0`… | 3 | soundtrack of the same-numbered video |
-| `ref_audio_0`… | 3 | standalone audio |
+- ComfyUI relaunches itself with the same command line, the way ComfyUI-Manager does it,
+  minus `--windows-standalone-build` so no extra browser tab opens.
+- The page shows "Restarting ComfyUI…", reconnects on its own, and re-checks saved
+  segments.
+- A running render stops. Finished segments are on disk, so nothing already rendered
+  is lost.
+- It works from any device that can reach ComfyUI, including over Tailscale.
 
-They go to the native node exactly as connected, so labels are numbered exactly
-as the native node numbers them. Audio labels count **video soundtracks first,
-then standalone audio**: with `ref_video_audio_0` connected, it's `<Audio 1>`
-and `ref_audio_0` becomes `<Audio 2>`. A soundtrack only counts when its
-same-numbered video is connected too.
+### What re-renders what
 
-Connect the audio VAE to `audio_vae` whenever any reference audio is connected.
+- **Editing a Shot's text, seconds or seed** re-renders that Shot in place. The Shots
+  after it keep their takes (or re-render too, if you ask).
+- **Bypassing, removing or inserting a Shot** re-renders nothing by itself; the Shots
+  renumber and keep their takes. With lip sync on, the Shots after it re-render to stay
+  in sync with the song.
+- **Cast & Scenes, Style & Sound, Settings, and the lip-sync or voice audio routes** are
+  shared by every Shot. Changing them re-renders everything from Shot 1. Earlier approvals
+  are kept as a "was ✓" flag.
+- **Song in final video** only changes what Video Combine muxes, so nothing re-renders.
 
-References ride through **every** segment, which is what keeps a character
-consistent across the joins. The text encoder runs per segment, but the VAE
-encodes of the references happen once per window length and are reused, so a
-reference video isn't re-encoded on every segment.
+### Quality notes for pinned Shots
 
-`first_frame` / `last_frame` use the image-to-video path instead, so they can't
-be combined with reference inputs.
+- A Shot pinned at both ends (an in-place reroll, or a Shot inserted between
+  rendered ones) has to travel from its start to a fixed end state. Give it at
+  least 5 s and write the arrival into its text ("…ends with her at the doorway,
+  facing screen left"). If the states are too different, the last second can
+  visibly morph.
+- End pins are a newer guide shape than first/last frames; check them early on
+  real renders. The fl2va model is expected to behave best.
+- The first frames after a pinned join can decode very slightly differently; this
+  is expected to be invisible.
 
----
+### Opening folders
 
-## RefMods
-
-Connect **Load H3 RefMods** straight to Long Shot's `refmods` input:
-
-```
-Load H3 RefMods ─→ mods ─→ [refmods] MiniMax H3 Long Shot
-```
-
-Long Shot does what **H3 RefMod Text Encode** does, on every segment. Each
-RefMod is shown to the text encoder under its own label, and its reference
-goes to the model in the same order. That pairing is what lets a line in your
-subject definitions, like `<hero> … whose appearance comes from <Picture 2>`,
-actually point at the RefMod.
-
-RefMods take the next free labels after your reference inputs. With one
-`ref_image` connected, the first image RefMod is `<Picture 2>`. Only inputs
-that actually arrive are numbered: a muted or bypassed loader takes no label,
-and slot names don't matter. The `plan` output lists every live reference at
-the top, dry run included, so you can write your Subject boxes to match:
-
-```
-Reference labels — use these in your subject definitions:
-  <Picture 1> = ref_image_0
-  <Picture 2> = hero_face (RefMod)
-  <Video 1> = hero_walk (RefMod)
-```
-
-A RefMod bundle with several members gets one label per member.
-
-Each row's strength from the loader applies, and a row at 0 is left out
-entirely, label included. Visual RefMods are decoded for the text encoder once
-per run, not once per segment, so connect the H3 video VAE. RefMods count as
-references, so they can't be combined with `first_frame` / `last_frame`.
-
-**H3 RefMod Step Curve** patches the model rather than the conditioning, so it
-goes on the `model` wire before Long Shot as usual. It still finds the RefMods.
-
-### extra_refs: Apply H3 RefMod without labels
-
-```
-MiniMax H3 RefMod Carrier ─→ [conditioning] Apply H3 RefMod ─→ [extra_refs] Long Shot
-```
-
-`extra_refs` takes reference blocks only. Use it when you want Apply H3
-RefMod's retention, curve, or scramble controls. Apply never shows a RefMod to
-the text encoder, so these blocks have **no label**: nothing in your prompt can
-point at them, and they act as unlabelled guidance. For a RefMod your prompt
-refers to, use `refmods`.
-
-The Carrier supplies the empty conditioning Apply needs, so only RefMod's own
-blocks reach `extra_refs`. Don't feed Apply from a Reference to Video node that
-has references connected, or those references go in twice. Long Shot warns
-when that happens, and also when the same RefMods seem to be connected to both
-`refmods` and `extra_refs`.
-
----
-
-## Limits
-
-- **The joins are structurally seamless, not semantically guaranteed.** The
-  latent stitch is exact, but whether the action reads as continuous still
-  depends on the model, prompts, and seed.
-- A segment opening mid-action restates that segment's Shot text. If a Shot
-  describes a one-time action, keep it inside one segment.
-- The stitched latent grows with every segment and is decoded at the end, so
-  long pieces need VAE memory for the full length.
-
----
-
-## How the stitch works
-
-H3 video tokens come in groups of five covering 17 frames, each group opening
-with a 1-frame token — which is why frame counts must be 17k+5. With a 17k+5
-overlap, each continuation's guide is a slice of the previous latent starting
-exactly on a group boundary, and the new tokens complete the previous clip's
-final partial group. One group straddles each join, so a single decode sees one
-continuous causal sequence. Audio boundaries are computed from global frame
-position, never accumulated, so they can't drift.
-
-Approach after [ttulttul/ComfyUI-Minimax-H3-Continuation](https://github.com/ttulttul/ComfyUI-Minimax-H3-Continuation),
-which uses only ComfyUI's native guide API — no monkey-patching, so it
-survives ComfyUI updates.
-
----
-
-## Front-end hooks (H3 Long Shot Studio)
-
-Long Shot also reports its work for front ends like H3 Long Shot Studio. None of this
-changes what it renders.
-
-- **Plan in `/history`.** The node returns its plan as a UI output: `text` holds the
-  same text as the `plan` output, and `plan_json` holds one row per segment with
-  `{index, seconds, frames, start, end, start_frame, window_frames, seed, own_seed,
-  status: "reused" | "render", reason}`. Dry runs include it too. On ComfyUI builds that
-  support `has_intermediate_output`, the plan is resent when a whole run is served from
-  ComfyUI's cache.
-- **Progress over the websocket.** For each segment, Long Shot sends `mmh3.longshot` with
-  `{segment, of, status: "reused" | "rendering" | "done", seed, seconds}` (plus
-  `source: "memory" | "disk"` on reused segments) to the client that queued the prompt.
-- Plan rows carry `source: "memory" | "disk"` for reused segments too.
-
----
+The **Open input folder** and **Open output folder** buttons open the folder on the machine
+running ComfyUI. They only work when you browse from that machine (a loopback connection with
+no proxy headers). From another device, such as over Tailscale, the buttons are hidden and
+**Download video** appears instead.
 
 ## Tests
 
-`tests/` runs the nodes against a real ComfyUI source tree (CPU mode, no model
-weights). Sampling is simulated as a perfect continuation, so the suite proves
-the bookkeeping is bit-exact — stitching, audio sync, and song slicing — and
-that the model's own `PackedLayout` places every guide on the right frames.
+`tests/` runs against a real ComfyUI source tree in CPU mode, with no model weights:
+
+- `test_graph_builder.py`: pure Python, no ComfyUI needed. Covers every toggle combination
+  (the 8 audio-route combinations, bypassed cast and Shots, LoRAs on and off with and without
+  Turbo, Sage missing, NVENC fallback, missing packs) and MiniMax's size table.
+- `test_comfy_integration.py`:
+  - ComfyUI's own `validate_prompt` accepts every variant, with the real packs loaded.
+  - The full core loop (dry run, Start, Continue, Reroll, edit, bypass, audio routes) runs
+    through ComfyUI's real executor. Loaders, decoders and the sampler are stand-ins; Long
+    Shot, the prompt nodes, LoadImage, KJ resize and VHS are real, and VHS writes a real mp4.
+  - Also covers the HTTP routes.
+- `test_studio_server.py`: who counts as local, open-folder path safety, portable model names.
+- `test_projects.py`:
+  - slugs, including non-Latin names;
+  - save → reload gives identical state;
+  - the slug survives a rename;
+  - two-tab conflicts;
+  - missing / changed / relinked references;
+  - `check-inputs` path refusal;
+  - Delete and Clear touch only the chosen files.
+- `test_comfy_integration.py` also covers crash-resume. After a simulated restart,
+  nothing is re-sampled and the model never loads until a new Shot renders.
 
 ```
 set COMFYUI_ROOT=C:\path\to\ComfyUI
+set MMH3_PROMPT_PACK=%COMFYUI_ROOT%\custom_nodes\H3_Prompt_Compiler
+set MMH3_LONGSHOT_PACK=%COMFYUI_ROOT%\custom_nodes\H3_Longshot
+set STUDIO_EXTRA_NODES=%COMFYUI_ROOT%\custom_nodes\ComfyUI-KJNodes;%COMFYUI_ROOT%\custom_nodes\ComfyUI-VideoHelperSuite;%COMFYUI_ROOT%\custom_nodes\ComfyUI-MiniMax-H3-Turbo;%COMFYUI_ROOT%\custom_nodes\ComfyUI-MelBandRoFormer;%COMFYUI_ROOT%\custom_nodes\ComfyUI-NVIDIA-RTX-VSR-Pro
 python -m pytest tests -q
 ```
 
-`test_frontend_hooks.py` covers the plan UI output, `plan_json` and the progress events,
-including a cached re-run through the real executor. `test_disk_segments.py` covers
-saved segments:
-
-- recipe fingerprints are identical with renumbered node ids, and change with any
-  upstream setting or a replaced model file;
-- save → restart → zero sampler calls, with exactly the fp16-rounded latent;
-- a resumed chain continues within fp16 rounding;
-- `.tmp` and corrupt files are handled;
-- memory-only and off modes;
-- through the real executor: a dry run and a fully reused run never load the model.
-
-Two optional suites run only when pointed at the other packs:
-`MMH3_PROMPT_PACK` (the comfyui-minimax-h3 folder) for the builder hand-off,
-and `REFMOD_PACK` (the ComfyUI-MiniMaxH3Mod folder) for the RefMod chain.
+Use your ComfyUI's Python. For the portable build that's `python_embeded\python.exe -m pip install pytest`,
+then `python_embeded\python.exe -m pytest ...`. If a pack folder isn't set, the tests that
+need it are skipped and say why.
