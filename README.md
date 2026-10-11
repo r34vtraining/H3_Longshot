@@ -1,5 +1,8 @@
 # ComfyUI — MiniMax H3 Long Shot
 
+<img width="1080" height="1837" alt="image" src="https://github.com/user-attachments/assets/14d09777-0138-45ca-9e67-63204f65857e" />
+
+
 ## What's new in 1.6.6
 
 - **Upscale Chunk** now drives **RTX VSR Pro** (whmc76/ComfyUI-NVIDIA-RTX-VSR-Pro) directly
