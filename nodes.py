@@ -379,6 +379,7 @@ def _segment_noise(noise, seed):
 # ---------------------------------------------------------------------------
 
 _SEGMENT_CACHE = OrderedDict()   # fingerprint -> sampled window (on CPU)
+_LAST_TAKES = {}                 # cache name -> {shot id: take used in its last timeline run}
 SEGMENT_CACHE_MAX = 64
 _LAST_RUN = []                   # per segment: {component: digest} of the last real run
 
@@ -553,6 +554,7 @@ def _recall(fp):
 
 def clear_segment_cache():
     _SEGMENT_CACHE.clear()
+    _LAST_TAKES.clear()
     _LAST_RUN.clear()
     _LAST_TIMELINE.clear()
 
@@ -1509,6 +1511,9 @@ def _run_timeline(p, *, model, clip, vae, audio_vae, noise, sampler, sigmas, wid
                           "offset": seg.overlap_frames, "pixels": p.locks[i]["clip"]["pixels"]})
     if spans:
         cumulative["mmh3_clips"] = spans
+    # which take every Shot ended up with, for MiniMax H3 Take (one Shot decoded on its own)
+    _LAST_TAKES[p.store.name] = {p.ids[i]: p.take_names[i] for i in range(n)
+                                 if p.kinds[i] != "clip" and p.take_names[i]}
     return (cumulative, plan.total_frames, total_s, report), timeline_rows(p, show_seeds is not None)
 
 
@@ -1913,19 +1918,470 @@ class MiniMaxH3ClipPixels:
         return (out,)
 
 
+class MiniMaxH3Take:
+    """One take on its own, as a latent you can decode: a single Shot's video
+    without stitching or decoding the rest of the long shot.
+
+    Give the take's file name, or a Shot id: then it's the take that Shot got
+    in the Long Shot run wired into 'after' (wire Long Shot's total_frames
+    there so it runs first)."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {
+            "cache_name": ("STRING", {"default": "default", "tooltip": "Long Shot's cache_name "
+                                      "(the project): takes are in output/longshot/<cache_name>/takes."}),
+        }, "optional": {
+            "take": ("STRING", {"default": "", "tooltip": "A take file name. Empty: the take the "
+                                "Shot below got in the last Long Shot run."}),
+            "shot_id": ("STRING", {"default": ""}),
+            "after": ("INT", {"forceInput": True, "tooltip": "Long Shot's total_frames, so this "
+                              "runs after it."}),
+        }}
+
+    RETURN_TYPES = ("LATENT", "INT")
+    RETURN_NAMES = ("latent", "frames")
+    FUNCTION = "load"
+    CATEGORY = "MiniMax H3"
+
+    @classmethod
+    def IS_CHANGED(cls, cache_name="default", take="", shot_id="", after=None):
+        # a Shot id means "whatever take the last run gave it": always look again
+        return take if take else float("nan")
+
+    def load(self, cache_name="default", take="", shot_id="", after=None):
+        store = disk.TakeStore(cache_name, STORE_ROOT)
+        name = take or _LAST_TAKES.get(store.name, {}).get(str(shot_id))
+        if not name:
+            raise ValueError(f"No take for Shot {shot_id!r}: run Long Shot first (wire its "
+                             "total_frames into 'after'), or give the take's file name.")
+        try:
+            video, audio, meta = store.load(name)
+        except FileNotFoundError:
+            raise ValueError(f"The take {name} isn't in {store.folder}.") from None
+        from comfy.nested_tensor import NestedTensor
+        frames = int(meta.get("window_frames") or 0)
+        return ({"samples": NestedTensor((video, audio))}, frames)
+
+
+
+class MiniMaxH3FrameRange:
+    """A range of frames from an image batch: frames start .. start+length-1
+    (fewer at the end). For upscaling a long decoded film a chunk at a time, so
+    only one chunk of upscaled frames is ever in memory. No 4096-frame limit."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {
+            "images": ("IMAGE",),
+            "start": ("INT", {"default": 0, "min": 0, "max": 10_000_000}),
+            "length": ("INT", {"default": 240, "min": 1, "max": 10_000_000}),
+        }}
+
+    RETURN_TYPES = ("IMAGE", "INT")
+    RETURN_NAMES = ("images", "total_frames")
+    FUNCTION = "pick"
+    CATEGORY = "MiniMax H3"
+
+    @classmethod
+    def IS_CHANGED(cls, **kwargs):
+        # always run: what comes after (an upscale, a saved chunk) must be made again
+        return float("nan")
+
+    def pick(self, images, start=0, length=240):
+        total = int(images.shape[0])
+        if start >= total:
+            raise ValueError(f"Frame {start} is past the end ({total} frames).")
+        part = images[start:start + length]
+        return {"ui": {"frame_range": [{"start": int(start), "count": int(part.shape[0]), "total": total}]},
+                "result": (part, total)}
+
+
+def write_wav_float(path, waveform, sample_rate):
+    """A 32-bit float WAV from a [channels, samples] tensor."""
+    import struct
+    data = waveform.detach().to("cpu", torch.float32).clamp(-1, 1)
+    channels, n = int(data.shape[0]), int(data.shape[1])
+    raw = data.t().contiguous().numpy().tobytes()
+    block = channels * 4
+    with open(path, "wb") as f:
+        f.write(b"RIFF" + struct.pack("<I", 4 + 26 + 12 + 8 + len(raw)) + b"WAVE")
+        f.write(b"fmt " + struct.pack("<IHHIIHHH", 18, 3, channels, int(sample_rate),
+                                      int(sample_rate) * block, block, 32, 0))
+        f.write(b"fact" + struct.pack("<II", 4, n))
+        f.write(b"data" + struct.pack("<I", len(raw)) + raw)
+
+
+class MiniMaxH3SaveAudio:
+    """Save a sound track as <output>/<filename_prefix>.wav (32-bit float),
+    overwriting. For joining chunked video files back up with their sound."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {
+            "audio": ("AUDIO",),
+            "filename_prefix": ("STRING", {"default": "longshot/audio"}),
+        }}
+
+    RETURN_TYPES = ()
+    OUTPUT_NODE = True
+    FUNCTION = "save"
+    CATEGORY = "MiniMax H3"
+
+    @classmethod
+    def IS_CHANGED(cls, **kwargs):
+        return float("nan")            # the file may have been cleaned up since
+
+    def save(self, audio, filename_prefix="longshot/audio"):
+        import os
+        import folder_paths
+        root = os.path.realpath(folder_paths.get_output_directory())
+        rel = str(filename_prefix).replace("\\", "/").strip("/")
+        path = os.path.realpath(os.path.join(root, *rel.split("/"))) + ".wav"
+        if not path.startswith(root + os.sep):
+            raise ValueError("filename_prefix must stay inside the output folder.")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        wave = audio["waveform"]
+        if wave.dim() == 3:
+            wave = wave[0]
+        write_wav_float(path, wave, audio["sample_rate"])
+        sub, name = os.path.split(os.path.relpath(path, root))
+        return {"ui": {"longshot_audio": [{"filename": name, "subfolder": sub.replace(os.sep, "/"),
+                                           "type": "output"}]}}
+
+
+
+def _ffmpeg_exe():
+    import shutil
+    import sys
+    for name, mod in list(sys.modules.items()):
+        if name.endswith("videohelpersuite.utils") and getattr(mod, "ffmpeg_path", None):
+            return mod.ffmpeg_path
+    try:
+        from imageio_ffmpeg import get_ffmpeg_exe
+        return get_ffmpeg_exe()
+    except Exception:
+        return shutil.which("ffmpeg")
+
+
+# What the chunk files are encoded with: Video Helper Suite's h264 mp4 formats
+# (nvenc or libx264) and the Studio's 10-bit ProRes 422 HQ master.
+_CHUNK_CODECS = {
+    "h264_nvenc": ["-c:v", "h264_nvenc", "-pix_fmt", "yuv420p", "-b:v", "8M"],
+    "libx264": ["-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "19"],
+    "prores_hq": ["-c:v", "prores_ks", "-profile:v", "hq", "-vendor", "apl0", "-pix_fmt", "yuv422p10le"],
+}
+_BT709 = ["-vf", "scale=out_color_matrix=bt709", "-color_range", "tv", "-colorspace", "bt709",
+          "-color_primaries", "bt709", "-color_trc", "bt709"]
+
+
+def _rtx_node():
+    import nodes as comfy_nodes
+    cls = comfy_nodes.NODE_CLASS_MAPPINGS.get("RTXVideoSuperResolution")
+    if cls is None:
+        raise ValueError("RTX Video Super Resolution isn't installed (Nvidia RTX Nodes for ComfyUI).")
+    return cls
+
+
+def _upscaler(scale, quality):
+    """RTX Video Super Resolution's node, called on a few frames at a time (the
+    fallback when its upscaler can't be driven directly)."""
+    cls = _rtx_node()
+    v3 = hasattr(cls, "define_schema") and callable(getattr(cls, "execute", None))
+
+    def run(frames):
+        if v3:      # the V3 node: resize_type is a dynamic combo
+            out = cls.execute(images=frames, resize_type={"resize_type": "scale by multiplier", "scale": float(scale)},
+                              quality=quality)
+        else:       # a classic node: the combo's value is a flattened input
+            out = getattr(cls(), cls.FUNCTION)(**{"images": frames, "resize_type": "scale by multiplier",
+                                                  "resize_type.scale": float(scale), "quality": quality})
+        if isinstance(out, dict):
+            out = out.get("result")
+        res = getattr(out, "result", None) or getattr(out, "args", None) or out
+        return res[0]
+    return run
+
+
+def _cuda_device():
+    import comfy.model_management as mm
+    device = mm.get_torch_device()
+    if device.type != "cuda":
+        raise RuntimeError("NVIDIA RTX Video Super Resolution needs a CUDA device.")
+    return device, device.index if device.index is not None else torch.cuda.current_device()
+
+
+class _Encoders:
+    """The ffmpeg encoders, fed from their own thread through a short queue, so
+    the GPU keeps upscaling while ffmpeg encodes (each chunk takes about as long
+    as the slower of the two, not both added up)."""
+
+    def __init__(self, procs, depth=16):
+        import queue
+        import threading
+        self.procs, self.q, self.error = procs, queue.Queue(maxsize=depth), None
+        self.thread = threading.Thread(target=self._work, name="longshot-encode", daemon=True)
+        self.thread.start()
+
+    def _work(self):
+        while True:
+            item = self.q.get()
+            if item is None:
+                return
+            if self.error is not None:
+                continue                                   # drain after a failure
+            try:
+                for proc, data in zip(self.procs, item):
+                    proc.stdin.write(data)
+            except BaseException as err:                  # e.g. the encoder stopped
+                self.error = err
+
+    def put(self, datas):
+        if self.error is not None:
+            raise self.error
+        self.q.put(datas)
+
+    def close(self):
+        self.q.put(None)
+        self.thread.join()
+        if self.error is not None:
+            raise self.error
+
+
+class _DirectVSR:
+    """The RTX upscaler (NVIDIA Video Effects, as the RTX node uses it) set up
+    once and fed one frame at a time: nothing bigger than a frame is ever
+    allocated, and the result stays on the GPU until it's converted for the
+    encoder. None when the RTX node isn't the one this was written against."""
+
+    MAX_EDGE = 15360        # past this the SDK misbehaves (RTX VSR Pro's finding); the node handles it
+
+    @classmethod
+    def make(cls, scale, quality, height, width, module=None):
+        """Works with Comfy-Org's Nvidia RTX Nodes and with RTX VSR Pro (whmc76),
+        which both drive NVIDIA's nvvfx; None when neither shape is there."""
+        import sys
+        try:
+            mod = module or sys.modules.get(_rtx_node().__module__)
+            nv = mod.nvvfx
+            levels = getattr(nv, "QualityLevel", None) or nv.effects.QualityLevel
+            level = levels[quality]
+            enc = getattr(getattr(nv, "ImageEncoding", None), "RGB8", None)
+            dev = getattr(mod, "get_effect_device", None) or _cuda_device
+        except Exception:
+            return None
+        self = cls(nv, dev, level, enc, scale, height, width)
+        return None if max(self.size) > cls.MAX_EDGE else self
+
+    def __init__(self, nv, get_device, level, enc, scale, height, width):
+        self.nv, self.get_device, self.level, self.enc = nv, get_device, level, enc
+        self.size = (max(8, round(height * scale / 8) * 8), max(8, round(width * scale / 8) * 8))
+
+    def __enter__(self):
+        self.device, index = self.get_device()
+        self._ctx = torch.cuda.device(self.device) if self.device.type == "cuda" else None
+        if self._ctx:
+            self._ctx.__enter__()
+        try:
+            self.effect = self.nv.VideoSuperRes(quality=self.level, strength=1.0, device=index,
+                                                image_encoding=self.enc) if self.enc is not None \
+                else self.nv.VideoSuperRes(self.level)
+        except TypeError:       # an nvvfx that only takes the quality
+            self.effect = self.nv.VideoSuperRes(self.level)
+        self._fx = self.effect.__enter__() or self.effect
+        self._fx.output_height, self._fx.output_width = self.size
+        self._fx.load()
+        return self
+
+    def __exit__(self, *exc):
+        try:
+            self.effect.__exit__(*exc)
+        finally:
+            if self._ctx:
+                self._ctx.__exit__(*exc)
+        return False
+
+    def __call__(self, frame):
+        """One HWC frame (CPU) -> the upscaled HWC frame (on the GPU, valid until the next call)."""
+        x = frame[..., :3].to(device=self.device, dtype=torch.float32).movedim(-1, 0).contiguous()
+        out = torch.from_dlpack(self._fx.run(x).image)
+        if not out.is_floating_point():
+            out = out.float() / 255.0
+        return out.movedim(0, -1)
+
+
+class MiniMaxH3UpscaleChunk:
+    """Upscale frames start .. start+length-1 of a decoded film with RTX Video
+    Super Resolution and save them as a video file (no sound). The upscaler is set
+    up once and fed one frame at a time; each upscaled frame is converted on the
+    GPU and goes straight to the encoder, so RAM holds the film and a frame or
+    two, and nothing big is left in ComfyUI's cache afterwards. (If the RTX node
+    isn't the version this drives directly, it's called on 24 frames at a time.)
+    Optionally also a 10-bit ProRes 422 HQ .mov of the same frames."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {
+            "images": ("IMAGE",),
+            "start": ("INT", {"default": 0, "min": 0, "max": 10_000_000}),
+            "length": ("INT", {"default": 240, "min": 1, "max": 10_000_000}),
+            "scale": ("FLOAT", {"default": 2.0, "min": 1.0, "max": 4.0, "step": 0.01}),
+            "quality": ("STRING", {"default": "ULTRA"}),
+            "filename_prefix": ("STRING", {"default": "longshot/chunk"}),
+            "codec": (["h264_nvenc", "libx264"], {"default": "libx264"}),
+        }, "optional": {
+            "master_prefix": ("STRING", {"default": "", "tooltip": "Also a ProRes 422 HQ .mov here (empty: none)."}),
+            "batch": ("INT", {"default": 0, "min": 0, "max": 2000, "tooltip": "Only when the upscaler can't be "
+                      "driven directly: frames per RTX node call (0: 24)."}),
+            "frame_rate": ("FLOAT", {"default": 24.0, "min": 1.0, "max": 240.0}),
+        }}
+
+    RETURN_TYPES = ()
+    OUTPUT_NODE = True
+    FUNCTION = "run"
+    CATEGORY = "MiniMax H3"
+
+    @classmethod
+    def IS_CHANGED(cls, **kwargs):
+        return float("nan")            # the file is made again every time (it may have been joined and removed)
+
+    @staticmethod
+    def _out(prefix, ext):
+        import os
+        import folder_paths
+        root = os.path.realpath(folder_paths.get_output_directory())
+        rel = str(prefix).replace("\\", "/").strip("/")
+        base = os.path.realpath(os.path.join(root, *rel.split("/")))
+        if not base.startswith(root + os.sep):
+            raise ValueError("filename_prefix must stay inside the output folder.")
+        os.makedirs(os.path.dirname(base), exist_ok=True)
+        path = f"{base}_00001.{ext}"
+        sub, name = os.path.split(os.path.relpath(path, root))
+        return path, {"filename": name, "subfolder": sub.replace(os.sep, "/"), "type": "output"}
+
+    def run(self, images, start=0, length=240, scale=2.0, quality="ULTRA", filename_prefix="longshot/chunk",
+            codec="libx264", master_prefix="", batch=0, frame_rate=24.0, _upscale=None, _ffmpeg=None,
+            _direct=None):
+        import subprocess
+        import comfy.model_management as mm
+        import comfy.utils
+        total = int(images.shape[0])
+        if start >= total:
+            raise ValueError(f"Frame {start} is past the end ({total} frames).")
+        part = images[start:start + length]
+        count = int(part.shape[0])
+        ffmpeg = _ffmpeg or _ffmpeg_exe()
+        if not ffmpeg:
+            raise ValueError("ffmpeg isn't available.")
+        outs = [(self._out(filename_prefix, "mp4"), _CHUNK_CODECS[codec], "rgb24")]
+        if master_prefix:
+            outs.append((self._out(master_prefix, "mov"), _CHUNK_CODECS["prores_hq"], "rgb48le"))
+        procs = []
+
+        def start_encoders(h, w):
+            for (path, _entry), args, pix in outs:
+                cmd = [ffmpeg, "-v", "error", "-y", "-f", "rawvideo", "-pix_fmt", pix,
+                       "-color_range", "pc", "-colorspace", "rgb", "-color_primaries", "bt709",
+                       "-color_trc", "bt709", "-s", f"{w}x{h}", "-r", str(frame_rate), "-i", "-",
+                       *args, *_BT709, path]
+                procs.append(subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE))
+
+        writer = []
+
+        def send(up):
+            """Upscaled frames (any device, [n, H, W, 3] in 0..1) to the encoders, converted where they are."""
+            if not writer:
+                writer.append(_Encoders(procs))
+            up = up[..., :3].clamp(0, 1)
+            datas = []
+            for _o, _a, pix in outs:
+                if pix == "rgb24":
+                    data = (up * 255 + 0.5).to(torch.uint8).cpu().contiguous().numpy()
+                else:
+                    data = (up * 65535 + 0.5).to(torch.int32).cpu().contiguous().numpy().astype("<u2")
+                datas.append(data.tobytes())
+            writer[0].put(datas)
+
+        pbar = comfy.utils.ProgressBar(count)
+        direct = None if _upscale else (_direct or _DirectVSR.make(scale, quality, int(images.shape[1]),
+                                                                   int(images.shape[2])))
+        try:
+            if direct is not None:
+                # one upscaler for the whole chunk, one frame at a time
+                logger.info("Upscale Chunk: frames %d-%d, RTX upscaler driven directly (one frame at a time)",
+                            start, start + count - 1)
+                with direct as vsr:
+                    start_encoders(*vsr.size)
+                    for i in range(count):
+                        if i % 24 == 0:
+                            mm.throw_exception_if_processing_interrupted()
+                        send(vsr(part[i])[None])
+                        pbar.update(1)
+            else:
+                upscale = _upscale or _upscaler(scale, quality)
+                step = max(1, int(batch) or 24)
+                logger.info("Upscale Chunk: frames %d-%d, through the RTX node, %d frames per call",
+                            start, start + count - 1, step)
+                for i in range(0, count, step):
+                    mm.throw_exception_if_processing_interrupted()
+                    up = upscale(part[i:i + step])
+                    if not procs:                                  # the size is known now
+                        start_encoders(int(up.shape[1]), int(up.shape[2]))
+                    for k in range(0, int(up.shape[0]), 8):        # small slices: no big copies
+                        send(up[k:k + 8])
+                    del up
+                    pbar.update(min(step, count - i))
+            if writer:
+                writer[0].close()
+        except BrokenPipeError:
+            msgs = []
+            for proc in procs:
+                proc.kill()
+                msgs.append((proc.stderr.read() or b"").decode("utf-8", "replace")[-500:])
+            if writer:
+                writer[0].q.put(None)                      # let the encoder thread finish
+            raise RuntimeError("The encoder stopped: " + " | ".join(m for m in msgs if m)) from None
+        except BaseException:
+            for proc in procs:
+                proc.kill()
+            if writer:
+                try:
+                    writer[0].close()
+                except BaseException:
+                    pass
+            raise
+        errors = []
+        for proc in procs:
+            proc.stdin.close()
+            err = proc.stderr.read()
+            if proc.wait() != 0:
+                errors.append(err.decode("utf-8", "replace")[-500:])
+        if errors:
+            raise RuntimeError("Encoding the chunk failed: " + " | ".join(errors))
+        ui = {"chunk_video": [outs[0][0][1]], "frame_range": [{"start": int(start), "count": count, "total": total}]}
+        if master_prefix:
+            ui["chunk_master"] = [outs[1][0][1]]
+        return {"ui": ui}
+
+
 NODE_CLASS_MAPPINGS = {
+    "MiniMaxH3Take": MiniMaxH3Take,
     "MiniMaxH3SongTrack": MiniMaxH3SongTrack,
     "MiniMaxH3RefModCarrier": MiniMaxH3RefModCarrier,
     "MiniMaxH3TimelineShot": MiniMaxH3TimelineShot,
     "MiniMaxH3Clip": MiniMaxH3Clip,
     "MiniMaxH3ClipShot": MiniMaxH3ClipShot,
     "MiniMaxH3ClipPixels": MiniMaxH3ClipPixels,
+    "MiniMaxH3FrameRange": MiniMaxH3FrameRange,
+    "MiniMaxH3SaveAudio": MiniMaxH3SaveAudio,
+    "MiniMaxH3UpscaleChunk": MiniMaxH3UpscaleChunk,
 }
 if MiniMaxH3LongShot is not None:
     NODE_CLASS_MAPPINGS["MiniMaxH3LongShot"] = MiniMaxH3LongShot
 else:
     logger.error("MiniMax H3 Long Shot needs a newer ComfyUI (V3 node API). Update ComfyUI.")
 NODE_DISPLAY_NAME_MAPPINGS = {
+    "MiniMaxH3Take": "MiniMax H3 Take",
     "MiniMaxH3LongShot": "MiniMax H3 Long Shot",
     "MiniMaxH3SongTrack": "MiniMax H3 Song Track",
     "MiniMaxH3RefModCarrier": "MiniMax H3 RefMod Carrier",
@@ -1933,4 +2389,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "MiniMaxH3Clip": "MiniMax H3 Clip",
     "MiniMaxH3ClipShot": "MiniMax H3 Clip Shot",
     "MiniMaxH3ClipPixels": "MiniMax H3 Clip Pixels",
+    "MiniMaxH3FrameRange": "MiniMax H3 Frame Range",
+    "MiniMaxH3SaveAudio": "MiniMax H3 Save Audio (WAV)",
+    "MiniMaxH3UpscaleChunk": "MiniMax H3 Upscale Chunk (RTX VSR → file)",
 }

@@ -1,5 +1,56 @@
 # ComfyUI — MiniMax H3 Long Shot
 
+## What's new in 1.6.6
+
+- **Upscale Chunk** now drives **RTX VSR Pro** (whmc76/ComfyUI-NVIDIA-RTX-VSR-Pro) directly
+  too, not only Comfy-Org's Nvidia RTX Nodes. With 1.6.5 it fell back to calling the node 24
+  frames at a time on that pack.
+- Upscaling and encoding overlap: frames go to ffmpeg from their own thread through a short
+  queue (16 frames), so the GPU keeps upscaling while ffmpeg encodes.
+- The ComfyUI console says which way each chunk ran: "RTX upscaler driven directly" or
+  "through the RTX node, N frames per call".
+
+## What's new in 1.6.5
+
+- **Upscale Chunk** drives the RTX upscaler itself: it's set up once per chunk and fed one
+  frame at a time, and each upscaled frame is converted on the GPU and goes straight to the
+  encoder. Nothing bigger than a frame is allocated, so RAM stays flat however many chunks
+  run, and the upscaler isn't set up again every few frames. (1.6.4's 3 GB batches were
+  faster but held on to memory between chunks on some systems.) If the installed RTX node
+  isn't the version it knows how to drive, it calls the node on 24 frames at a time instead.
+
+## What's new in 1.6.3
+
+- New node **MiniMax H3 Upscale Chunk (RTX VSR → file)**: upscales frames `start` to
+  `start + length − 1` of a decoded film with RTX Video Super Resolution a few frames at a
+  time and pipes them straight into the encoder (H.264 MP4, optionally also a 10-bit ProRes
+  422 HQ .mov), without sound. It returns only the file names, so no upscaled frames stay
+  in ComfyUI's cache: RAM holds the film plus one small batch, however many chunks run.
+  H3 Long Shot Studio 0.6.10 uses it for its chunked upscale.
+
+## What's new in 1.6.2
+
+- New node **MiniMax H3 Frame Range**: frames `start` to `start + length − 1` of an image
+  batch, plus the batch's total frame count (no 4,096-frame limit). Upscale a long decoded
+  film one chunk at a time with it, so only one chunk of upscaled frames is in RAM.
+- New node **MiniMax H3 Save Audio (WAV)**: saves a sound track as a 32-bit float WAV at
+  `output/<filename_prefix>.wav`, to join chunked video files back up with their sound.
+  (The Studio's chunked upscale uses Save Audio, with the Upscale Chunk node from 1.6.3.)
+
+## What's new in 1.6.1
+
+- A Long Shot now takes up to **64** Shots (was 16). Each Shot still samples only its own
+  window, so a longer film doesn't make a render heavier; decoding the whole film at once
+  (the stitched video) does take RAM in proportion to its length.
+
+## What's new in 1.6.0
+
+- New node **MiniMax H3 Take**: one take on its own, as a latent you can decode. Give it a
+  take's file name, or a Shot id plus Long Shot's `total_frames` (wired into `after`) to get
+  the take that Shot got in that run. Decoding a single take costs one Shot, however long
+  the film, so a front end can show each Shot as it renders and stitch + decode the whole
+  film only at the end. H3 Long Shot Studio 0.6.5 uses it for its timeline.
+
 ## What's new in 1.5.1
 
 **Fix:** a run where every Shot is locked or reused no longer stops with "Reference audio is
