@@ -1,6 +1,7 @@
 # ComfyUI — MiniMax H3 Long Shot
 
-<img width="1080" height="1837" alt="image" src="https://github.com/user-attachments/assets/14d09777-0138-45ca-9e67-63204f65857e" />
+<img width="1558" height="1298" alt="image" src="https://github.com/user-attachments/assets/0a0810b6-fda0-4165-9172-297f6c459538" />
+
 
 
 ## What's new in 1.6.6
