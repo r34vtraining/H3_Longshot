@@ -1,4 +1,5 @@
 # H3 Long Shot Studio
+<img width="1719" height="1360" alt="image" src="https://github.com/user-attachments/assets/bc8b2b5b-1928-461a-a95f-b6a3f9f66e76" />
 
 ## What's new in 0.7.3
 
