@@ -226,7 +226,7 @@ class _RefEncoder:
         h3, _ = _native()
         extra = [x for x in (extra_images or []) if x is not None]
         if extra:
-            # this Shot's frame anchors: more <Picture N>, after the references
+            # this Shot's frame anchors and context picture: more <Picture N>, after the references
             import node_helpers
             refs = dict(self.refs)
             images = dict(refs.get("ref_images") or {})
@@ -1148,14 +1148,17 @@ def _prepare_timeline(*, shots, bundle, refs, labels, native_refs, model, clip, 
         refmods=refmods, extra_blocks=extra_blocks, first_frame=first_frame,
         last_frame=last_frame, recipe=recipe)
     comps = [piece_components(sp, seeds[i], noise, shared, song) for i, sp in enumerate(prompts)]
-    # frame anchors (images the Shot starts from / ends on) are part of what it is
-    anchors = [(sh.get("start_image"), sh.get("end_image")) if kinds[i] != "clip" else (None, None)
-               for i, sh in enumerate(shots)]
-    for i, (a0, a1) in enumerate(anchors):
+    # frame anchors (images the Shot starts from / ends on) and its context
+    # image (a reference only, never pinned) are part of what it is
+    anchors = [(sh.get("start_image"), sh.get("end_image"), sh.get("context_image"))
+               if kinds[i] != "clip" else (None, None, None) for i, sh in enumerate(shots)]
+    for i, (a0, a1, cx) in enumerate(anchors):
         if a0 is not None or a1 is not None:
             comps[i]["frames"] = _digest([comps[i]["frames"], "anchors",
                                           _digest(a0) if a0 is not None else None,
                                           _digest(a1) if a1 is not None else None])
+        if cx is not None:
+            comps[i]["frames"] = _digest([comps[i]["frames"], "context", _digest(cx)])
 
     # Pins and fingerprints, left to right.
     ov = overlap_frames
@@ -1467,11 +1470,11 @@ def _run_timeline(p, *, model, clip, vae, audio_vae, noise, sampler, sigmas, wid
             encoder = _RefEncoder(clip, vae, audio_vae, width, height, p.refs, ref_image_size,
                                   refmods)
         sp = prompts[i]
-        a0, a1 = p.anchors[i] if getattr(p, "anchors", None) else (None, None)
+        a0, a1, cx = p.anchors[i] if getattr(p, "anchors", None) else (None, None, None)
         positive = encoder.encode(sp.prompt, seg.window_frames,
                                   first_frame if sp.first_frame else None,
                                   last_frame if sp.last_frame else None,
-                                  extra_images=[a0, a1])
+                                  extra_images=[a0, a1, cx])
         positive = _add_ref_blocks(positive, p.extra_blocks)
         st, en = p.starts[i], p.ends[i]
         anchor_kfs = []
@@ -1800,6 +1803,10 @@ class MiniMaxH3TimelineShot:
                 "end_image": ("IMAGE", {"tooltip": "Frame anchor: the Shot ends on this image "
                               "(the next <Picture N>), pinned at its last frame, unless it's "
                               "pinned to the Shot after it."}),
+                "context_image": ("IMAGE", {"tooltip": "Context: a reference picture for this Shot "
+                                  "only (the next <Picture N>, after the frame anchors), never "
+                                  "pinned. E.g. the last frame of the Shot before, with join "
+                                  "'cut': a new angle that keeps the scene's continuity."}),
             },
         }
 
@@ -1809,7 +1816,7 @@ class MiniMaxH3TimelineShot:
     CATEGORY = "MiniMax H3"
 
     def add(self, shot_id, seconds, text, shot_seed=-1, lock="", join="bridge", frames=0,
-            shots=None, start_image=None, end_image=None):
+            shots=None, start_image=None, end_image=None, context_image=None):
         chain = list(shots) if shots else []
         if not str(shot_id).strip():
             logger.warning("MiniMax H3 Timeline Shot %d has no shot_id; it is filed as shot%d, "
@@ -1833,6 +1840,8 @@ class MiniMaxH3TimelineShot:
             chain[-1]["start_image"] = start_image[:1]
         if end_image is not None:
             chain[-1]["end_image"] = end_image[:1]
+        if context_image is not None:
+            chain[-1]["context_image"] = context_image[-1:]
         return (chain,)
 
 

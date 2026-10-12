@@ -1,5 +1,14 @@
 # ComfyUI — MiniMax H3 Long Shot
 
+## What's new in 1.6.8
+
+- **Context image** on **MiniMax H3 Timeline Shot**: optional `context_image`. A reference
+  picture for that Shot only (its next `<Picture N>`, after the references and any frame
+  anchors), never pinned as a keyframe. With `join` set to `cut` it gives a new camera angle
+  that keeps the scene's continuity, e.g. the last frame of the Shot before. It's part of
+  the Shot's fingerprint, so a new image makes a new take. H3 Long Shot Studio 0.8.0 uses it
+  for its Context joins.
+
 ## What's new in 1.6.7
 
 - **Frame anchors** on **MiniMax H3 Timeline Shot**: optional `start_image` / `end_image`.
