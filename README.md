@@ -1,5 +1,12 @@
 # ComfyUI — MiniMax H3 Long Shot
 
+## What's new in 1.6.10
+
+- Up to **256 Shots** per Long Shot (was 64). Each Shot still samples only its own window.
+- **Upscale Chunk** at `scale` 1 only encodes its frames (no RTX upscaler, no RTX GPU
+  needed). H3 Long Shot Studio 0.8.5 uses it to decode a film one continuous run at a time,
+  split only at hard cuts.
+
 ## What's new in 1.6.9
 
 - **Per-Shot retention** on **MiniMax H3 Timeline Shot**: optional `retention`, extra

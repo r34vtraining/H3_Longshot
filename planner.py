@@ -30,7 +30,7 @@ AUDIO_LATENT_FPS = 40
 GROUP_FRAMES = 17
 TRAINED_MIN_FRAMES = 124   # ComfyUI: "trained range is ~124-362"
 TRAINED_MAX_FRAMES = 362
-MAX_SEGMENTS = 64        # a sanity cap: each Shot samples only its own window
+MAX_SEGMENTS = 256       # a sanity cap: each Shot samples only its own window (64 before 1.6.10)
 
 
 # ---------------------------------------------------------------------------

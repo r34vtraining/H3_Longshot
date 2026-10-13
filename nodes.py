@@ -2299,7 +2299,8 @@ class MiniMaxH3UpscaleChunk:
             "images": ("IMAGE",),
             "start": ("INT", {"default": 0, "min": 0, "max": 10_000_000}),
             "length": ("INT", {"default": 240, "min": 1, "max": 10_000_000}),
-            "scale": ("FLOAT", {"default": 2.0, "min": 1.0, "max": 4.0, "step": 0.01}),
+            "scale": ("FLOAT", {"default": 2.0, "min": 1.0, "max": 4.0, "step": 0.01,
+                                "tooltip": "1: no upscale, the frames are only encoded (no RTX GPU needed)."}),
             "quality": ("STRING", {"default": "ULTRA"}),
             "filename_prefix": ("STRING", {"default": "longshot/chunk"}),
             "codec": (["h264_nvenc", "libx264"], {"default": "libx264"}),
@@ -2377,6 +2378,10 @@ class MiniMaxH3UpscaleChunk:
             writer[0].put(datas)
 
         pbar = comfy.utils.ProgressBar(count)
+        if float(scale) <= 1.0 and _upscale is None:
+            # 1.6.10: scale 1 = no upscale, only the frames start .. start+length-1
+            # encoded (a piece of a film decoded run by run). No RTX GPU needed.
+            _upscale = lambda x: x                                            # noqa: E731
         direct = None if _upscale else (_direct or _DirectVSR.make(scale, quality, int(images.shape[1]),
                                                                    int(images.shape[2])))
         try:
