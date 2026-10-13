@@ -1807,6 +1807,10 @@ class MiniMaxH3TimelineShot:
                                   "only (the next <Picture N>, after the frame anchors), never "
                                   "pinned. E.g. the last frame of the Shot before, with join "
                                   "'cut': a new angle that keeps the scene's continuity."}),
+                "retention": ("STRING", {"multiline": True, "default": "", "tooltip": "Extra "
+                              "retention_analysis lines for this Shot only, added after the shared "
+                              "ones. E.g. '<Picture 4> (reference for [Shot 1]): weak_reference - …' "
+                              "for a context picture."}),
             },
         }
 
@@ -1816,7 +1820,7 @@ class MiniMaxH3TimelineShot:
     CATEGORY = "MiniMax H3"
 
     def add(self, shot_id, seconds, text, shot_seed=-1, lock="", join="bridge", frames=0,
-            shots=None, start_image=None, end_image=None, context_image=None):
+            shots=None, start_image=None, end_image=None, context_image=None, retention=""):
         chain = list(shots) if shots else []
         if not str(shot_id).strip():
             logger.warning("MiniMax H3 Timeline Shot %d has no shot_id; it is filed as shot%d, "
@@ -1842,6 +1846,8 @@ class MiniMaxH3TimelineShot:
             chain[-1]["end_image"] = end_image[:1]
         if context_image is not None:
             chain[-1]["context_image"] = context_image[-1:]
+        if str(retention or "").strip():       # only when given, so older chains keep their prompts
+            chain[-1]["retention"] = str(retention).strip()
         return (chain,)
 
 

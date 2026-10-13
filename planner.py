@@ -424,7 +424,13 @@ def build_prompts(shots: list[dict], plan: Plan, bundle: dict, *, reference_mode
                 align = alignment_line("i2va", seg.window_frames)
             elif final:
                 align = alignment_line("l2va", seg.window_frames)
-        prompt = compose_prompt(shot.get("text", ""), bundle, reference_mode=reference_mode,
+        own = (shot.get("retention") or "").strip()
+        b = bundle
+        if own and reference_mode:
+            # this Shot's own retention lines, after the shared ones
+            shared = (bundle.get("retention_analysis") or "").strip()
+            b = dict(bundle, retention_analysis=f"{shared}\n{own}" if shared else own)
+        prompt = compose_prompt(shot.get("text", ""), b, reference_mode=reference_mode,
                                 audio_reuse=audio_reuse, alignment=align)
         out.append(SegmentPrompt(seg, prompt, first, final))
     return out

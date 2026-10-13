@@ -1,5 +1,13 @@
 # ComfyUI — MiniMax H3 Long Shot
 
+## What's new in 1.6.9
+
+- **Per-Shot retention** on **MiniMax H3 Timeline Shot**: optional `retention`, extra
+  `retention_analysis` lines for that Shot only, added after the shared ones (full-reference
+  format). E.g. a context picture marked `weak_reference`, so the Shot takes the characters,
+  objects and surroundings from it without opening on that frame. Empty: the prompt is as
+  before. H3 Long Shot Studio 0.8.3 uses it for its Context joins.
+
 ## What's new in 1.6.8
 
 - **Context image** on **MiniMax H3 Timeline Shot**: optional `context_image`. A reference
