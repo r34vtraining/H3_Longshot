@@ -4,6 +4,7 @@ with optional lip-sync to a song."""
 from __future__ import annotations
 
 import inspect
+import os
 import logging
 import math
 from collections import OrderedDict
@@ -39,7 +40,7 @@ def _require_arbitrary_guides():
     if "frame_count" in inspect.signature(PackedLayout.__init__).parameters:
         raise RuntimeError(
             "This ComfyUI build predates native MiniMax H3 guides at arbitrary frames. "
-            "Update ComfyUI to use MiniMax H3 Long Shot."
+            "Update ComfyUI to 0.35.0 or later to use MiniMax H3 Long Shot."
         )
 
 
@@ -341,7 +342,305 @@ def _sample_window(model, noise, sampler, sigmas, positive, latent):
     _, cs = _native()
     guider = cs.Guider_Basic(model)
     guider.set_conds(positive)
+    _middle_frame_previews(guider)
     return _unwrap(cs.SamplerCustomAdvanced.execute(noise, guider, sampler, sigmas, latent))[0]
+
+
+def _previews_on():
+    try:
+        from comfy.cli_args import args, LatentPreviewMethod
+        return args.preview_method != LatentPreviewMethod.NoPreviews
+    except Exception:
+        return False
+
+
+def _middle_first(x0):
+    """ComfyUI's video previews show latent frame 0, which in a window is the zone
+    shared with the Shot before. Hand the previewer a copy whose frame 0 is the
+    window's middle frame (new footage). Only the preview (and the unused
+    denoised output) see the copy; the sampler's own latent is untouched."""
+    nested = getattr(x0, "is_nested", False)
+    v = x0.tensors[0] if nested else x0
+    if not torch.is_tensor(v) or v.ndim != 5 or v.shape[2] < 3:
+        return x0
+    k = v.shape[2] // 2
+    v2 = v.clone()
+    v2[:, :, 0] = v[:, :, k]
+    if nested:
+        return type(x0)([v2] + list(x0.tensors[1:]))
+    return v2
+
+
+# Live preview switch (1.6.13), per client: "taesd" | "latent2rgb" | "none". Set by
+# H3 Long Shot Studio while a render runs; Long Shot then makes the step previews
+# itself and reads the switch at every step, so turning it on or off takes effect
+# at the next step. Clients that never set it get ComfyUI's own previews.
+LIVE_PREVIEW = {}
+LIVE_METHODS = ("taesd", "latent2rgb", "none")
+
+
+def set_live_preview(client_id, method):
+    """The Studio's switch for its client. Returns the method kept."""
+    method = str(method or "none")
+    if method not in LIVE_METHODS:
+        raise ValueError(f"method must be one of {', '.join(LIVE_METHODS)}")
+    if client_id:
+        LIVE_PREVIEW[str(client_id)] = method
+    return method
+
+
+def _current_client():
+    try:
+        from server import PromptServer
+        return getattr(getattr(PromptServer, "instance", None), "client_id", None)
+    except Exception:
+        return None
+
+
+def _live_method():
+    """This run's switch, or None when its client never set one."""
+    c = _current_client()
+    return LIVE_PREVIEW.get(str(c)) if c else None
+
+
+class _OwnPreviews:
+    """Step previews made by Long Shot (the Studio's switch). The previewer is
+    built on first use for each method, the way ComfyUI builds its own.
+
+    On a CUDA device previews never wait for the GPU: latent2rgb (1.6.14) and the
+    taeh3 decoder (1.6.15) run on the GPU behind the sampling, the picture is copied
+    to pinned memory in the background and goes out at a later step once the copy
+    is done. Waiting for the GPU at every step stalls ComfyUI's weight streaming
+    when H3 doesn't fit in VRAM (measured: 31.4 -> 40.1 s/step)."""
+
+    def __init__(self, patcher):
+        self.patcher = patcher
+        self.made = {}
+        self.pending = None          # (step, total, host uint8, cuda event)
+        self.factors = None
+        self.sent = 0
+        self.skipped = 0
+        self.ms = 0.0
+        self.background = False
+        self.host = None
+
+    def _background_ok(self, v):
+        return (getattr(v, "is_cuda", False) and getattr(self.patcher, "model", None) is not None
+                and getattr(self.patcher.model.latent_format, "latent_rgb_factors", None) is not None)
+
+    @staticmethod
+    def _host_buffer(shape):
+        return torch.empty(shape, dtype=torch.uint8, pin_memory=True)
+
+    @staticmethod
+    def _new_event():
+        return torch.cuda.Event()
+
+    def previewer(self, method):
+        if method not in self.made:
+            import latent_preview
+            from comfy.cli_args import args, LatentPreviewMethod
+            saved = args.preview_method
+            try:
+                args.preview_method = LatentPreviewMethod.from_string(method)
+                self.made[method] = latent_preview.get_previewer(
+                    self.patcher.load_device, self.patcher.model.latent_format)
+            finally:
+                args.preview_method = saved
+        return self.made[method]
+
+    @staticmethod
+    def _hook(step, total_steps, image):
+        import comfy.utils
+        hook = getattr(comfy.utils, "PROGRESS_BAR_HOOK", None)
+        if hook is not None:
+            hook(step + 1, total_steps, image)
+
+    def rgb(self, v):
+        """latent2rgb as uint8 H x W x 3 on v's device (ComfyUI's math, no copy back)."""
+        fmt = self.patcher.model.latent_format
+        if self.factors is None or self.factors[0].device != v.device or self.factors[0].dtype != v.dtype:
+            f = torch.tensor(fmt.latent_rgb_factors, device=v.device, dtype=v.dtype).transpose(0, 1)
+            bias = getattr(fmt, "latent_rgb_factors_bias", None)
+            b = torch.tensor(bias, device=v.device, dtype=v.dtype) if bias is not None else None
+            self.factors = (f, b)
+        f, b = self.factors
+        reshape = getattr(fmt, "latent_rgb_factors_reshape", None)
+        if reshape is not None:
+            v = reshape(v)
+        v = v[0, :, 0] if v.ndim == 5 else v[0]
+        img = torch.nn.functional.linear(v.movedim(0, -1), f, bias=b)
+        return ((img + 1.0) / 2.0).clamp(0, 1).mul(255).to(torch.uint8)
+
+    def flush(self, wait=False):
+        """Send the background preview once its copy is done (or now, at the end)."""
+        if self.pending is None:
+            return
+        step, total_steps, host, ev = self.pending
+        if not wait and not ev.query():
+            return
+        ev.synchronize()
+        self.pending = None
+        from PIL import Image
+        import latent_preview
+        frame = Image.fromarray(host.numpy().copy())          # the buffer is reused at the next step
+        self._hook(step, total_steps, ("JPEG", frame, latent_preview.MAX_PREVIEW_RESOLUTION))
+        self.sent += 1
+
+    def send(self, method, step, x0, total_steps):
+        import time as _time
+        t0 = _time.perf_counter()
+        v = x0.tensors[0] if getattr(x0, "is_nested", False) else x0
+        try:
+            sharp = _sharp_decoder(v.device) if method == "taesd" and self._background_ok(v) else None
+            if method == "taesd" and self._background_ok(v) and sharp is None:
+                method = "latent2rgb"                 # no taeh3 file: the rough preview, as ComfyUI does
+            if method in ("latent2rgb", "taesd") and self._background_ok(v):
+                self.flush()
+                if self.pending is not None:          # the last copy isn't done yet: skip this step
+                    self.skipped += 1
+                    return
+                u8 = _sharp_frame(sharp, v) if method == "taesd" else self.rgb(v)
+                if self.host is None or self.host.shape != u8.shape:
+                    self.host = self._host_buffer(u8.shape)    # one pinned buffer per window
+                self.host.copy_(u8, non_blocking=True)
+                ev = self._new_event()
+                ev.record()
+                self.pending = (step, total_steps, self.host, ev)
+                self.background = True
+                return
+            pv = self.previewer(method)
+            if pv is None:
+                return
+            self._hook(step, total_steps, pv.decode_latent_to_preview_image("JPEG", v))
+            self.sent += 1
+        finally:
+            self.ms += (_time.perf_counter() - t0) * 1000.0
+
+
+_SHARP = {}          # device -> (path, TAEHV on that device, dtype)
+
+
+def _taeh3_path():
+    import folder_paths
+    name = next((f for f in folder_paths.get_filename_list("vae_approx")
+                 if os.path.basename(f).startswith("taeh3")), None)
+    return folder_paths.get_full_path("vae_approx", name) if name else None
+
+
+def _sharp_decoder(device):
+    """Long Shot's own copy of the taeh3 decoder on `device` (22 MB), kept for the
+    session. ComfyUI's VAE.decode moves each frame to the CPU (a wait) and runs its
+    memory manager every call; running the decoder directly does neither."""
+    try:
+        path = _taeh3_path()
+    except Exception:
+        path = None
+    if not path:
+        return None
+    key = str(device)
+    got = _SHARP.get(key)
+    if got is None or got[0] != path:
+        import comfy.utils
+        from comfy.sd import VAE
+        vae = VAE(comfy.utils.load_torch_file(path))
+        tae = vae.first_stage_model
+        dtype = vae.vae_dtype
+        tae = tae.to(device=device, dtype=dtype).eval()
+        tae.show_progress_bar = False
+        got = _SHARP[key] = (path, tae, dtype)
+    return got
+
+
+def _sharp_frame(sharp, v):
+    """taeh3 decode of the window's first latent frame (the middle one, after
+    _middle_first) as uint8 H x W x 3 on v's device. Queued on the GPU, no copy back."""
+    from comfy.taesd.taehv import apply_model_with_memblocks
+    _path, tae, dtype = sharp
+    x = v[:1, :, :1].to(dtype=dtype)                  # [1, C, 1, h, w]
+    x = tae.process_in(x).movedim(2, 1)               # [1, 1, C, h, w]
+    with torch.no_grad():
+        y = apply_model_with_memblocks(tae.decoder, x, tae.parallel, False, output_device=v.device,
+                                       patch_size=tae.patch_size, decode=True)
+    y = y[:, tae.frames_to_trim:].clamp(0, 1)          # [1, T, 3, H, W]
+    return y[0, 0].movedim(0, -1).mul(255).round().to(torch.uint8)
+
+
+def _vram_note(patcher):
+    """'H3 in VRAM 21.3 of 38.0 GB (partial) · free 1.2 GB', as far as ComfyUI tells."""
+    try:
+        import comfy.model_management as mm
+        size, loaded = patcher.model_size(), patcher.loaded_size()
+        note = f"model in VRAM {loaded / 2**30:.1f} of {size / 2**30:.1f} GB" + \
+            (" (partial)" if size and loaded < size * 0.98 else "")
+        free = mm.get_free_memory(patcher.load_device)
+        return note + f" · free VRAM {free / 2**30:.1f} GB"
+    except Exception:
+        return ""
+
+
+def _middle_frame_previews(guider):
+    """Step previews show the middle of each window instead of its first frame.
+    With the Studio's switch they follow it step by step; otherwise ComfyUI's
+    own previews (when on) get the middle frame. Each window logs its timing
+    (1.6.14), previews on or off, so their cost can be measured."""
+    import time as _time
+    inner = guider.sample
+    patcher = getattr(guider, "model_patcher", None)
+    own = _OwnPreviews(patcher)
+
+    def sample(*args, **kwargs):
+        cb = kwargs.get("callback")
+        t = {"start": _time.perf_counter(), "steps": 0, "cb_ms": 0.0, "first": None, "methods": set()}
+        if cb is not None:
+            def callback(step, x0, x, total_steps):
+                c0 = _time.perf_counter()
+                if t["first"] is None:
+                    t["first"] = c0 - t["start"]
+                t["steps"] += 1
+                method = _live_method()
+                try:
+                    if method is None:
+                        if _previews_on():
+                            t["methods"].add("comfyui")
+                            try:
+                                x0 = _middle_first(x0)
+                            except Exception:        # a preview must never cost the render
+                                pass
+                        return cb(step, x0, x, total_steps)
+                    out = cb(step, x0, x, total_steps)       # progress (ComfyUI's own previewer is off)
+                    if method != "none":
+                        t["methods"].add(method)
+                        try:
+                            own.send(method, step, _middle_first(x0), total_steps)
+                        except Exception as err:
+                            logger.debug("MiniMax H3 Long Shot: live preview skipped: %s", err)
+                    else:
+                        own.pending = None
+                    return out
+                finally:
+                    t["cb_ms"] += (_time.perf_counter() - c0) * 1000.0
+            kwargs["callback"] = callback
+        try:
+            return inner(*args, **kwargs)
+        finally:
+            try:
+                own.flush(wait=True)
+            except Exception:
+                own.pending = None
+            total = _time.perf_counter() - t["start"]
+            n = t["steps"]
+            if n:
+                prev = ", ".join(sorted(t["methods"])) or "off"
+                bg = " (background copy)" if own.background else ""
+                logger.info(
+                    "MiniMax H3 Long Shot timing: %d steps in %.1f s = %.2f s/step (first step %.2f s) · "
+                    "previews: %s%s, %d sent, %d skipped, %.1f ms/step in preview code · "
+                    "%.1f ms/step in step callbacks%s",
+                    n, total, total / n, t["first"] or 0.0, prev, bg, own.sent, own.skipped,
+                    own.ms / n, t["cb_ms"] / n,
+                    (" · " + note) if (note := (_vram_note(patcher) if patcher is not None else "")) else "")
+    guider.sample = sample
 
 
 def _is_reseedable(noise):
@@ -654,6 +953,7 @@ class MiniMaxH3SongTrack:
 
     def load(self, audio, audio_vae):
         h3, _ = _native()
+        _require_arbitrary_guides()          # older builds: a plain "update ComfyUI"
         latent, _t = h3._encode_ref_audio(audio_vae, audio)
         seconds = audio["waveform"].shape[-1] / audio["sample_rate"]
         logger.info("MiniMax H3 Song Track: %.2fs, %d audio tokens", seconds, latent.shape[-1])
@@ -1885,6 +2185,7 @@ class MiniMaxH3Clip:
 
     def prepare(self, images, vae, audio_vae, width, height, frames=0, audio_mode="clip", audio=None):
         h3, _ = _native()
+        _require_arbitrary_guides()          # older builds: a plain "update ComfyUI"
         if width % 32 or height % 32:
             raise ValueError("width and height must be multiples of 32")
         have = int(images.shape[0])

@@ -1,5 +1,41 @@
 # ComfyUI — MiniMax H3 Long Shot
 
+## What's new in 1.6.15
+
+- **The sharp live preview (taeh3) no longer slows renders either**: Long Shot keeps its own
+  copy of the 22 MB decoder on the GPU and runs it behind the sampling, like the rough
+  preview, instead of going through ComfyUI's preview decoder (which waits for the GPU and
+  runs the memory manager every step). Measured with H3 partly in VRAM: off 31.4 s/step,
+  rough (1.6.14) 31.4, sharp through ComfyUI's decoder 40.1.
+
+## What's new in 1.6.14
+
+- **Timing log**: every Shot's sampling prints one line in the ComfyUI console, previews on or
+  off: seconds per step, time spent on previews, and how much of the model sits in VRAM, e.g.
+  `MiniMax H3 Long Shot timing: 8 steps in 41.2 s = 5.15 s/step (first step 9.80 s) · previews:
+  latent2rgb (background copy), 8 sent, 0 skipped, 0.6 ms/step in preview code · … · model in
+  VRAM 21.3 of 38.0 GB (partial) · free VRAM 1.2 GB`. Compare a render with the Studio's Live
+  preview on and one with it off.
+- **The rough live preview no longer waits for the GPU**: on NVIDIA cards its colours are copied
+  in the background and sent a step later, so ComfyUI's weight streaming isn't stalled at every
+  step. (A step whose copy isn't done yet is skipped, never waited for.)
+
+## What's new in 1.6.13
+
+- **Live-preview switch read at every step**: H3 Long Shot Studio 0.8.11 can turn a tab's step
+  previews on or off while a Shot renders; Long Shot then makes the previews itself (taeh3
+  or latent2rgb, the middle of the window) and follows the switch from the next step.
+  Without the Studio, ComfyUI's own preview setting works as before.
+- Step previews through ComfyUI's own previewer cost time when the model doesn't fit in VRAM (about 30–40% slower in testing); 1.6.14 / 1.6.15 remove that for the Studio's live preview.
+
+## What's new in 1.6.12
+
+- **Live previews show new footage**: when ComfyUI's previews are on, each Shot's preview is the
+  middle of its window, not its first frame (the overlap with the Shot before). The render
+  itself is unchanged.
+- On a ComfyUI older than **0.35.0**, every node that needs native H3 says to update ComfyUI
+  (Clip Shots with sound no longer fail with an `_encode_ref_audio` error).
+
 ## What's new in 1.6.11
 
 - **MiniMax H3 Save Video**: frames (and sound) to an mp4 (H.264, NVENC or libx264) or a 10-bit
@@ -140,8 +176,8 @@ A single Shot works too: it's one ordinary generation with nothing to stitch, so
 the same workflow covers any length.
 
 Requires the [H3 Prompt Compiler](https://github.com/r34vtraining/H3_Prompt_Compiler) pack (for the Shot and Ref Prompt
-Builder r2v nodes) and a ComfyUI build with native MiniMax H3, arbitrary-frame
-guides, and the V3 node API.
+Builder r2v nodes) and **ComfyUI 0.35.0 or later** (native MiniMax H3 with arbitrary-frame
+guides and the V3 node API).
 
 ---
 
@@ -153,7 +189,8 @@ git clone https://github.com/r34vtraining/H3_Prompt_Compiler
 git clone https://github.com/r34vtraining/H3_Longshot
 ```
 
-Restart ComfyUI. No extra dependencies (`safetensors` ships with ComfyUI). Seven nodes appear under **MiniMax H3**: Long Shot, Timeline Shot, Clip, Clip Shot, Clip Pixels, Song Track, and RefMod Carrier.
+Install `requirements.txt` with ComfyUI's own Python (it adds `imageio-ffmpeg`, an ffmpeg for
+Save / Load Video when none is on PATH), then restart ComfyUI. Seven nodes appear under **MiniMax H3**: Long Shot, Timeline Shot, Clip, Clip Shot, Clip Pixels, Song Track, and RefMod Carrier.
 
 **Updating from an earlier version.** The new widgets (`save_to_disk`, `cache_name`)
 come after the existing ones, so saved workflows keep their values. If your saved
