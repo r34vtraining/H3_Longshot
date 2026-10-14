@@ -1,5 +1,13 @@
 # ComfyUI — MiniMax H3 Long Shot
 
+## What's new in 1.6.11
+
+- **MiniMax H3 Save Video**: frames (and sound) to an mp4 (H.264, NVENC or libx264) or a 10-bit
+  ProRes 422 HQ .mov, numbered like Video Combine (`<prefix>_00001-audio.mp4`).
+- **MiniMax H3 Load Video**: a clip's frames at 24 fps (trimmed and scaled) and its sound.
+- Both use ffmpeg (on PATH, or `pip install imageio-ffmpeg`), so H3 Long Shot Studio 0.8.7 no
+  longer needs Video Helper Suite.
+
 ## What's new in 1.6.10
 
 - Up to **256 Shots** per Long Shot (was 64). Each Shot still samples only its own window.

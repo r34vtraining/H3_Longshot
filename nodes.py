@@ -2443,6 +2443,193 @@ class MiniMaxH3UpscaleChunk:
         return {"ui": ui}
 
 
+# ---------------------------------------------------------------------------
+# Video in and out without Video Helper Suite (1.6.11): Save Video (frames +
+# sound -> mp4 / ProRes .mov, named like Video Combine) and Load Video (a clip's
+# frames at 24 fps, scaled and trimmed, and its sound). ffmpeg does the work.
+# ---------------------------------------------------------------------------
+
+def _next_counter(folder, stem):
+    """The next free _NNNNN for <stem>_NNNNN* in folder (Video Combine's numbering)."""
+    import os
+    import re
+    n = 0
+    pat = re.compile(re.escape(stem) + r"_(\d{5})")
+    if os.path.isdir(folder):
+        for f in os.listdir(folder):
+            m = pat.match(f)
+            if m:
+                n = max(n, int(m.group(1)))
+    return n + 1
+
+
+class MiniMaxH3SaveVideo:
+    """Frames (and sound) to <output>/<filename_prefix>_NNNNN[-audio].mp4 with ffmpeg:
+    H.264 (NVENC or libx264), or a 10-bit ProRes 422 HQ .mov with PCM sound."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {
+            "images": ("IMAGE",),
+            "filename_prefix": ("STRING", {"default": "longshot/video"}),
+            "codec": (["libx264", "h264_nvenc", "prores_hq"], {"default": "libx264"}),
+            "frame_rate": ("FLOAT", {"default": 24.0, "min": 1.0, "max": 240.0}),
+        }, "optional": {
+            "audio": ("AUDIO",),
+        }, "hidden": {"prompt": "PROMPT", "extra_pnginfo": "EXTRA_PNGINFO"}}
+
+    RETURN_TYPES = ()
+    OUTPUT_NODE = True
+    FUNCTION = "save"
+    CATEGORY = "MiniMax H3"
+
+    def save(self, images, filename_prefix="longshot/video", codec="libx264", frame_rate=24.0, audio=None,
+             prompt=None, extra_pnginfo=None, _ffmpeg=None):
+        import os
+        import subprocess
+        import tempfile
+        import folder_paths
+        root = os.path.realpath(folder_paths.get_output_directory())
+        rel = str(filename_prefix).replace("\\", "/").strip("/")
+        base = os.path.realpath(os.path.join(root, *rel.split("/")))
+        if not base.startswith(root + os.sep):
+            raise ValueError("filename_prefix must stay inside the output folder.")
+        folder, stem = os.path.split(base)
+        os.makedirs(folder, exist_ok=True)
+        ffmpeg = _ffmpeg or _ffmpeg_exe()
+        if not ffmpeg:
+            raise ValueError("ffmpeg isn't available. Install it (or pip install imageio-ffmpeg).")
+        ext = "mov" if codec == "prores_hq" else "mp4"
+        n = _next_counter(folder, stem)
+        name = f"{stem}_{n:05d}{'-audio' if audio is not None else ''}.{ext}"
+        path = os.path.join(folder, name)
+        frames = int(images.shape[0])
+        h, w = int(images.shape[1]), int(images.shape[2])
+        pix = "rgb48le" if codec == "prores_hq" else "rgb24"
+        wav = None
+        cmd = [ffmpeg, "-v", "error", "-y", "-f", "rawvideo", "-pix_fmt", pix, "-color_range", "pc",
+               "-colorspace", "rgb", "-color_primaries", "bt709", "-color_trc", "bt709",
+               "-s", f"{w}x{h}", "-r", str(frame_rate), "-i", "-"]
+        if audio is not None:
+            fd, wav = tempfile.mkstemp(suffix=".wav", dir=folder)
+            os.close(fd)
+            wave = audio["waveform"]
+            write_wav_float(wav, wave[0] if wave.dim() == 3 else wave, audio["sample_rate"])
+            # the sound padded or cut to exactly the picture's length (-shortest differs between ffmpeg builds)
+            secs = frames / float(frame_rate)
+            cmd += ["-i", wav, "-map", "0:v:0", "-map", "1:a:0",
+                    "-af", f"apad=whole_dur={secs:.6f},atrim=0:{secs:.6f}", "-t", f"{secs:.6f}"]
+            cmd += ["-c:a", "pcm_s24le"] if codec == "prores_hq" else ["-c:a", "aac", "-b:a", "192k"]
+        cmd += [*_CHUNK_CODECS[codec], *_BT709]
+        # the workflow travels with the file, as with Video Combine (drop it on ComfyUI to reopen)
+        import json
+        if prompt is not None:
+            cmd += ["-metadata", "prompt=" + json.dumps(prompt)]
+        if isinstance(extra_pnginfo, dict) and extra_pnginfo.get("workflow") is not None:
+            cmd += ["-metadata", "workflow=" + json.dumps(extra_pnginfo["workflow"])]
+        cmd += ["-movflags", "+faststart+use_metadata_tags" if ext == "mp4" else "+use_metadata_tags"]
+        cmd.append(path)
+        proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
+        try:
+            for i in range(0, frames, 8):
+                part = images[i:i + 8, ..., :3].clamp(0, 1)
+                if pix == "rgb24":
+                    data = (part * 255 + 0.5).to(torch.uint8).cpu().contiguous().numpy()
+                else:
+                    data = (part * 65535 + 0.5).to(torch.int32).cpu().contiguous().numpy().astype("<u2")
+                proc.stdin.write(data.tobytes())
+            proc.stdin.close()
+            err = proc.stderr.read()
+            if proc.wait() != 0:
+                raise RuntimeError("Saving the video failed: " + err.decode("utf-8", "replace")[-500:])
+        except BaseException:
+            proc.kill()
+            raise
+        finally:
+            if wav and os.path.exists(wav):
+                os.remove(wav)
+        sub = os.path.relpath(folder, root).replace(os.sep, "/")
+        entry = {"filename": name, "subfolder": sub, "type": "output",
+                 "format": "video/quicktime" if ext == "mov" else "video/mp4", "frame_rate": float(frame_rate),
+                 "fullpath": path}
+        return {"ui": {"gifs": [entry]}}
+
+
+class MiniMaxH3LoadVideo:
+    """A clip from the input folder at 24 fps: frames skip .. skip+cap-1, scaled to
+    width x height (the Clip node centre-crops), and the sound of those frames."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {
+            "video": ("STRING", {"default": "", "tooltip": "A file in ComfyUI's input folder (subfolders allowed)."}),
+            "skip_first_frames": ("INT", {"default": 0, "min": 0, "max": 10_000_000}),
+            "frame_load_cap": ("INT", {"default": 0, "min": 0, "max": 10_000_000, "tooltip": "0: to the end."}),
+            "width": ("INT", {"default": 0, "min": 0, "max": 16384, "tooltip": "0: the clip's own size."}),
+            "height": ("INT", {"default": 0, "min": 0, "max": 16384}),
+            "force_rate": ("FLOAT", {"default": 24.0, "min": 1.0, "max": 240.0}),
+        }}
+
+    RETURN_TYPES = ("IMAGE", "INT", "AUDIO")
+    RETURN_NAMES = ("images", "frame_count", "audio")
+    FUNCTION = "load"
+    CATEGORY = "MiniMax H3"
+
+    @classmethod
+    def IS_CHANGED(cls, video, **kwargs):
+        import os
+        import folder_paths
+        try:
+            p = folder_paths.get_annotated_filepath(video)
+            return f"{os.path.getmtime(p)}:{os.path.getsize(p)}"
+        except Exception:
+            return float("nan")
+
+    def load(self, video, skip_first_frames=0, frame_load_cap=0, width=0, height=0, force_rate=24.0, _ffmpeg=None):
+        import os
+        import subprocess
+        import numpy as np
+        import folder_paths
+        path = folder_paths.get_annotated_filepath(video)
+        if not path or not os.path.isfile(path):
+            raise ValueError(f"The clip {video} isn't in the input folder.")
+        ffmpeg = _ffmpeg or _ffmpeg_exe()
+        if not ffmpeg:
+            raise ValueError("ffmpeg isn't available. Install it (or pip install imageio-ffmpeg).")
+        if not (width and height):
+            import re
+            info = subprocess.run([ffmpeg, "-hide_banner", "-i", path], capture_output=True)
+            m = re.search(r"Video:.*?(\d{2,5})x(\d{2,5})", (info.stderr or b"").decode("utf-8", "replace"))
+            if not m:
+                raise ValueError("Couldn't read the clip's size.")
+            width, height = int(m.group(1)), int(m.group(2))
+        w, h = int(width) // 2 * 2, int(height) // 2 * 2
+        skip, cap = int(skip_first_frames), int(frame_load_cap)
+        trim = f"trim=start_frame={skip}" + (f":end_frame={skip + cap}" if cap else "")
+        vf = f"fps={force_rate},{trim},setpts=PTS-STARTPTS,scale={w}:{h}:flags=bicubic"
+        res = subprocess.run([ffmpeg, "-v", "error", "-i", path, "-an", "-vf", vf, "-f", "rawvideo",
+                              "-pix_fmt", "rgb24", "-"], capture_output=True)
+        if res.returncode != 0 or not res.stdout:
+            raise RuntimeError("Reading the clip failed: " + (res.stderr or b"").decode("utf-8", "replace")[-400:])
+        arr = np.frombuffer(res.stdout, dtype=np.uint8)
+        count = arr.size // (w * h * 3)
+        images = torch.from_numpy(arr[:count * w * h * 3].reshape(count, h, w, 3).copy()).float() / 255.0
+        # its sound, the same span (silence when the clip has none)
+        start, dur = skip / force_rate, count / force_rate
+        rate = 48000
+        a = subprocess.run([ffmpeg, "-v", "error", "-ss", f"{start:.6f}", "-i", path, "-t", f"{dur:.6f}", "-vn",
+                            "-ac", "2", "-ar", str(rate), "-f", "f32le", "-"], capture_output=True)
+        samples = int(round(dur * rate))
+        if a.returncode == 0 and a.stdout:
+            wave = torch.from_numpy(np.frombuffer(a.stdout, dtype="<f4").copy()).reshape(-1, 2).T
+            if wave.shape[1] < samples:
+                wave = torch.nn.functional.pad(wave, (0, samples - wave.shape[1]))
+            wave = wave[:, :samples]
+        else:
+            wave = torch.zeros(2, samples)
+        return (images, count, {"waveform": wave.unsqueeze(0), "sample_rate": rate})
+
+
 NODE_CLASS_MAPPINGS = {
     "MiniMaxH3Take": MiniMaxH3Take,
     "MiniMaxH3SongTrack": MiniMaxH3SongTrack,
@@ -2454,6 +2641,8 @@ NODE_CLASS_MAPPINGS = {
     "MiniMaxH3FrameRange": MiniMaxH3FrameRange,
     "MiniMaxH3SaveAudio": MiniMaxH3SaveAudio,
     "MiniMaxH3UpscaleChunk": MiniMaxH3UpscaleChunk,
+    "MiniMaxH3SaveVideo": MiniMaxH3SaveVideo,
+    "MiniMaxH3LoadVideo": MiniMaxH3LoadVideo,
 }
 if MiniMaxH3LongShot is not None:
     NODE_CLASS_MAPPINGS["MiniMaxH3LongShot"] = MiniMaxH3LongShot
@@ -2471,4 +2660,6 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "MiniMaxH3FrameRange": "MiniMax H3 Frame Range",
     "MiniMaxH3SaveAudio": "MiniMax H3 Save Audio (WAV)",
     "MiniMaxH3UpscaleChunk": "MiniMax H3 Upscale Chunk (RTX VSR → file)",
+    "MiniMaxH3SaveVideo": "MiniMax H3 Save Video (mp4 / ProRes)",
+    "MiniMaxH3LoadVideo": "MiniMax H3 Load Video (24 fps)",
 }

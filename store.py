@@ -32,7 +32,7 @@ import torch
 logger = logging.getLogger("MiniMaxH3LongShot")
 
 STORE_FORMAT = 1
-LONGSHOT_VERSION = "1.6.10"
+LONGSHOT_VERSION = "1.6.11"
 MODEL_EXTENSIONS = (".safetensors", ".sft", ".ckpt", ".pt", ".pt2", ".pth", ".bin", ".gguf", ".pkl")
 RECIPE_INPUTS = {"model": ("model", "clip", "vae", "audio_vae"), "sampler": ("sampler", "sigmas")}
 
