@@ -2789,6 +2789,7 @@ class MiniMaxH3SaveVideo:
         import os
         import subprocess
         import tempfile
+        import json
         import folder_paths
         root = os.path.realpath(folder_paths.get_output_directory())
         rel = str(filename_prefix).replace("\\", "/").strip("/")
@@ -2807,10 +2808,12 @@ class MiniMaxH3SaveVideo:
         frames = int(images.shape[0])
         h, w = int(images.shape[1]), int(images.shape[2])
         pix = "rgb48le" if codec == "prores_hq" else "rgb24"
-        wav = None
-        cmd = [ffmpeg, "-v", "error", "-y", "-f", "rawvideo", "-pix_fmt", pix, "-color_range", "pc",
+        wav = meta = None
+        # inputs first (stdin frames, the sound, the metadata file), then the output's options
+        ins = [ffmpeg, "-v", "error", "-y", "-f", "rawvideo", "-pix_fmt", pix, "-color_range", "pc",
                "-colorspace", "rgb", "-color_primaries", "bt709", "-color_trc", "bt709",
                "-s", f"{w}x{h}", "-r", str(frame_rate), "-i", "-"]
+        outs = []
         if audio is not None:
             fd, wav = tempfile.mkstemp(suffix=".wav", dir=folder)
             os.close(fd)
@@ -2818,18 +2821,27 @@ class MiniMaxH3SaveVideo:
             write_wav_float(wav, wave[0] if wave.dim() == 3 else wave, audio["sample_rate"])
             # the sound padded or cut to exactly the picture's length (-shortest differs between ffmpeg builds)
             secs = frames / float(frame_rate)
-            cmd += ["-i", wav, "-map", "0:v:0", "-map", "1:a:0",
-                    "-af", f"apad=whole_dur={secs:.6f},atrim=0:{secs:.6f}", "-t", f"{secs:.6f}"]
-            cmd += ["-c:a", "pcm_s24le"] if codec == "prores_hq" else ["-c:a", "aac", "-b:a", "192k"]
-        cmd += [*_CHUNK_CODECS[codec], *_BT709]
-        # the workflow travels with the file, as with Video Combine (drop it on ComfyUI to reopen)
-        import json
+            ins += ["-i", wav]
+            outs += ["-map", "0:v:0", "-map", "1:a:0",
+                     "-af", f"apad=whole_dur={secs:.6f},atrim=0:{secs:.6f}", "-t", f"{secs:.6f}"]
+            outs += ["-c:a", "pcm_s24le"] if codec == "prores_hq" else ["-c:a", "aac", "-b:a", "192k"]
+        # The workflow travels with the file, as with Video Combine (drop it on ComfyUI to
+        # reopen). It goes in an ffmetadata file, not on the command line: a big project's
+        # workflow is longer than Windows allows a command line to be (WinError 206, 1.6.16).
+        tags = {}
         if prompt is not None:
-            cmd += ["-metadata", "prompt=" + json.dumps(prompt)]
+            tags["prompt"] = json.dumps(prompt)
         if isinstance(extra_pnginfo, dict) and extra_pnginfo.get("workflow") is not None:
-            cmd += ["-metadata", "workflow=" + json.dumps(extra_pnginfo["workflow"])]
-        cmd += ["-movflags", "+faststart+use_metadata_tags" if ext == "mp4" else "+use_metadata_tags"]
-        cmd.append(path)
+            tags["workflow"] = json.dumps(extra_pnginfo["workflow"])
+        if tags:
+            fd, meta = tempfile.mkstemp(suffix=".ffmeta.txt", dir=folder)
+            with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as fh:
+                fh.write(_ffmetadata(tags))
+            ins += ["-f", "ffmetadata", "-i", meta]
+            outs += ["-map_metadata", str(2 if audio is not None else 1)]
+        outs += [*_CHUNK_CODECS[codec], *_BT709]
+        outs += ["-movflags", "+faststart+use_metadata_tags" if ext == "mp4" else "+use_metadata_tags"]
+        cmd = ins + outs + [path]
         proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
         try:
             for i in range(0, frames, 8):
@@ -2847,13 +2859,24 @@ class MiniMaxH3SaveVideo:
             proc.kill()
             raise
         finally:
-            if wav and os.path.exists(wav):
-                os.remove(wav)
+            for tmp in (wav, meta):
+                if tmp and os.path.exists(tmp):
+                    os.remove(tmp)
         sub = os.path.relpath(folder, root).replace(os.sep, "/")
         entry = {"filename": name, "subfolder": sub, "type": "output",
                  "format": "video/quicktime" if ext == "mov" else "video/mp4", "frame_rate": float(frame_rate),
                  "fullpath": path}
         return {"ui": {"gifs": [entry]}}
+
+
+def _ffmetadata(tags):
+    """An FFMETADATA1 file's text: '=', ';', '#', backslash and newlines escaped."""
+    def esc(v):
+        v = str(v)
+        for ch in ("\\", "=", ";", "#", "\n"):
+            v = v.replace(ch, "\\" + ch)
+        return v
+    return ";FFMETADATA1\n" + "".join(f"{esc(k)}={esc(v)}\n" for k, v in tags.items())
 
 
 class MiniMaxH3LoadVideo:

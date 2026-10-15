@@ -1,5 +1,12 @@
 # ComfyUI — MiniMax H3 Long Shot
 
+## What's new in 1.6.16
+
+- **Fix (Windows)**: Save Video failed with `[WinError 206] The filename or extension is too long`
+  on big projects. The workflow saved inside the video now goes through a small metadata file
+  instead of ffmpeg's command line, which Windows limits to 32,767 characters. Saved videos still
+  carry the workflow (drop one on ComfyUI to reopen it).
+
 ## What's new in 1.6.15
 
 - **The sharp live preview (taeh3) no longer slows renders either**: Long Shot keeps its own
