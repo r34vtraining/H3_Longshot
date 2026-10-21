@@ -442,7 +442,9 @@ def build_prompts(shots: list[dict], plan: Plan, bundle: dict, *, reference_mode
 
 def render_plan(plan: Plan, prompts: list[SegmentPrompt], seeds: list[int] | None = None,
                 song_offset: float | None = None, include_prompts: bool = True,
-                statuses: list[str] | None = None, own_seeds: list[bool] | None = None) -> str:
+                statuses: list[str] | None = None, own_seeds: list[bool] | None = None,
+                song_ref_at: list[float] | None = None,
+                song_pin_at: list[float] | None = None) -> str:
     """The plan as text. include_prompts=False gives the short console version:
     one line per segment plus warnings, without the prompt bodies."""
     total = seconds(plan.total_frames)
@@ -450,7 +452,8 @@ def render_plan(plan: Plan, prompts: list[SegmentPrompt], seeds: list[int] | Non
         f"MiniMax H3 Long Shot — {len(plan.segments)} segments, "
         f"{plan.total_frames} frames ({total:.2f}s)",
         f"overlap {plan.overlap_frames} frames"
-        + (" · lip-sync song connected" if song_offset is not None else ""),
+        + (" · lip-sync song connected" if song_offset is not None else "")
+        + (" · song as reference audio" if song_ref_at is not None else ""),
         "",
     ]
     for sp in prompts:
@@ -473,11 +476,15 @@ def render_plan(plan: Plan, prompts: list[SegmentPrompt], seeds: list[int] | Non
             head += f" · {statuses[s.index - 1]}"
         lines.append(head)
         if song_offset is not None:
-            w0 = song_offset + seconds(s.window_start)
-            w1 = song_offset + seconds(s.window_end)
+            w0 = song_offset + (song_pin_at[s.index - 1] if song_pin_at else seconds(s.window_start))
+            w1 = w0 + seconds(s.window_frames)
             lines.append(f"  lyrics for this Shot: song {fmt_time(w0)}–{fmt_time(w1)}"
                          + (f" (includes {seconds(s.overlap_frames):.2f}s overlap)"
                             if s.overlap_frames else ""))
+        if song_ref_at is not None:
+            a = song_ref_at[s.index - 1]
+            lines.append(f"  song as reference audio for this Shot: {fmt_time(a)}–"
+                         f"{fmt_time(a + seconds(s.window_frames))} of the song")
         if include_prompts:
             lines += ["-" * len(head), sp.prompt, ""]
     for w in plan.warnings:

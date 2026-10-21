@@ -1,5 +1,50 @@
 # ComfyUI — MiniMax H3 Long Shot
 
+## What's new in 1.7.0
+
+- **A refine pass**, e.g. the sharper fl2va model over takes made with ref2va. New inputs on
+  Long Shot: `refine_model` (with its own model sampling / Turbo LoRA), `refine_sigmas` (a
+  BasicScheduler with denoise below 1), `refine_mode`, `refine_key`, `model_name` and
+  `refine_model_name`.
+  - **new takes:** each Shot is resampled with the refine model right after it's sampled, with
+    the same prompt, references and pins. The refined latent *is* the take, and the next
+    Continuous Shot continues from its refined end.
+  - **new and locked takes:** locked takes are refined too, in film order (each continuing from
+    the refined one before), for exports. They're kept in `takes/refined` and reused while the
+    refine settings (`refine_key`) stay the same; MiniMax H3 Take's new `refine` input loads them.
+  - Takes made with the refine model itself (`model_name` = `refine_model_name`) are never refined.
+- Each take records the model that made it (`model`) and its refine (`refine`).
+
+## What's new in 1.6.19
+
+- **`song_at` places the pinned song too.** With Song Track connected (the song pinned to each
+  Shot's timeline for lip sync), a Shot's `song_at` now says where its window starts in the song,
+  the same as for `song_ref`. Connect the whole song to Song Track; H3 Long Shot Studio 0.9.3 fills
+  in `song_at` from the whole film. The plan's "lyrics for this Shot" shows the real place.
+
+## What's new in 1.6.18
+
+- **A song as reference audio, one slice per Shot.** Long Shot takes an optional `song_ref`
+  (AUDIO): each Shot gets its own slice of the song as the first standalone reference audio
+  (`<Audio 1>` when no reference videos carry soundtracks), the way MiniMax's Reference to Video
+  node takes reference audio. Voice references in `ref_audios` follow it.
+- **`song_at`** on Timeline Shot / Clip Shot: where that Shot's window starts in the song, in
+  seconds. Left at -1, it's where the window sits on this timeline (with `song_gap`).
+  H3 Long Shot Studio 0.9.2 fills it in from the whole film.
+- The slice is part of the Shot's fingerprint: moving it re-renders that Shot only. The plan lists
+  each Shot's slice and notes one that runs past the end of the song (the rest is silence).
+
+## What's new in 1.6.17
+
+- **Lip sync keeps each Shot's place in the song** when Shots before it (or between) are left
+  out of a render: Timeline Shot / Clip Shot take an optional `song_gap`, the seconds of each
+  Shot left out right before it (e.g. `5,5,4.5`; a rendered one as `w<frames>`, its take's frames). Long Shot plans the whole timeline with them
+  in, so every Shot gets the song where it really sits. H3 Long Shot Studio 0.9.0 fills it in.
+- **MiniMax H3 Song Cut**: the original song (not H3's re-encode) cut to what Long Shot made:
+  one Shot's take window (`shot_id`), or the whole run with each piece from its own place.
+  The Studio uses it to put the real song on each take's clip.
+- Each timeline row reports `song_at`: where that Shot's window starts in the song.
+
 ## What's new in 1.6.16
 
 - **Fix (Windows)**: Save Video failed with `[WinError 206] The filename or extension is too long`

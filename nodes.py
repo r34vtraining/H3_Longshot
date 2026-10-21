@@ -111,6 +111,16 @@ def _native_label_counts(refs):
             "audio": len(soundtracks) + len(refs["ref_audios"])}
 
 
+def _with_song(refs, song_ref):
+    """refs as the native node sees them for a Shot when song_ref is connected
+    (1.6.18): the song slice is the first standalone reference audio."""
+    if song_ref is None:
+        return refs
+    out = dict(refs)
+    out["ref_audios"] = {"song_ref": song_ref, **(refs.get("ref_audios") or {})}
+    return out
+
+
 def native_labels(refs):
     """The label each live reference input gets, in the native node's order:
     images, then each video (its soundtrack's <Audio> label first), then
@@ -223,9 +233,32 @@ class _RefEncoder:
     def has_refs(self):
         return any(self.refs.values()) or bool(self._mod_blocks)
 
-    def encode(self, prompt, frames, first_frame=None, last_frame=None, extra_images=None):
+    def encode(self, prompt, frames, first_frame=None, last_frame=None, extra_images=None,
+               song=None, song_key=None):
         h3, _ = _native()
         extra = [x for x in (extra_images or []) if x is not None]
+        if song is not None:
+            # 1.6.18: this Shot's slice of the song is the first standalone reference audio
+            import node_helpers
+            refs = dict(self.refs)
+            refs["ref_audios"] = {"song_ref": song, **(refs.get("ref_audios") or {})}
+            if extra:
+                images = dict(refs.get("ref_images") or {})
+                for k, img in enumerate(extra):
+                    images[f"ref_image_anchor{k}"] = img
+                refs["ref_images"] = images
+            clip = _PresentingClip(self.clip, self._mod_items) if self._mod_items else self.clip
+            key = (frames, _digest(extra) if extra else None, "song", song_key)
+            cached = self._blocks.get(key)
+            out = h3.MiniMaxH3ReferenceToVideo.execute(
+                clip, prompt, self.width, self.height, frames, ref_image_size=self.ref_image_size,
+                vae=None if cached is not None else self.vae,
+                audio_vae=None if cached is not None else self.audio_vae, **refs)
+            positive = _unwrap(out)[0]
+            if cached is None:
+                cached = self._blocks[key] = list(positive[0][1].get("minimax_refs", []) or [])
+            return node_helpers.conditioning_set_values(
+                positive, {"minimax_refs": list(cached) + list(self._mod_blocks)})
         if extra:
             # this Shot's frame anchors and context picture: more <Picture N>, after the references
             import node_helpers
@@ -268,10 +301,155 @@ class _RefEncoder:
             positive, {"minimax_refs": list(cached) + list(self._mod_blocks)})
 
 
-def _song_slice(song, seg):
-    """This window's audio from the pre-encoded song, at exact 40 Hz boundaries."""
+def _song_slice(song, seg, shift=0):
+    """This window's audio from the pre-encoded song, at exact 40 Hz boundaries.
+    `shift` (frames, 1.6.17): where the window really sits in the song when Shots
+    before it are left out of this render."""
     a0, a1 = seg.window_audio_span
+    if shift:
+        return _song_tokens(song, planner.audio_at(seg.window_start + shift), a1 - a0)
     return song["latent"][..., a0:a1].clone()
+
+
+def _song_tokens(song, a0, n):
+    """n audio tokens of the song from token a0 (silence past its end)."""
+    lat = song["latent"]
+    part = lat[..., a0:a0 + n]
+    if part.shape[-1] < n:
+        pad = torch.zeros(*lat.shape[:-1], n - part.shape[-1], dtype=lat.dtype, device=lat.device)
+        part = torch.cat([part, pad], -1)
+    return part.clone()
+
+
+def _song_ref_at(plan, shots, shifts=None):
+    """1.6.18: where each piece's window starts in song_ref, in seconds: the Shot's
+    song_at when given (H3 Long Shot Studio works it out from the whole film),
+    else the window's place on this timeline (plus its song_gap shift)."""
+    out = []
+    for i, (seg, sh) in enumerate(zip(plan.segments, shots)):
+        v = sh.get("song_at") if isinstance(sh, dict) else None
+        try:
+            v = float(v) if v is not None and v != "" else None
+        except (TypeError, ValueError):
+            v = None
+        if v is not None and v >= 0:
+            out.append(v)
+        else:
+            out.append(planner.seconds(seg.window_start + (int(shifts[i]) if shifts else 0)))
+    return out
+
+
+def _song_ref_slice(song_ref, start, frames):
+    """frames/24 seconds of song_ref from `start` seconds (silence past its end),
+    as an AUDIO for the native reference input."""
+    wave = song_ref["waveform"]
+    sr = int(song_ref["sample_rate"])
+    s0 = max(0, int(round(float(start) * sr)))
+    n = max(1, int(round(frames / planner.FPS * sr)))
+    part = wave[..., s0:s0 + n]
+    if part.shape[-1] < n:
+        pad = torch.zeros(*wave.shape[:-1], n - part.shape[-1], dtype=wave.dtype, device=wave.device)
+        part = torch.cat([part, pad], -1)
+    return {"waveform": part.contiguous(), "sample_rate": sr}
+
+
+def _song_ref_notes(song_ref, plan, at, skip=()):
+    """Plan notes when a Shot's slice runs past the end of song_ref."""
+    if song_ref is None:
+        return []
+    have = song_ref["waveform"].shape[-1] / float(song_ref["sample_rate"])
+    out = []
+    for i, (seg, a) in enumerate(zip(plan.segments, at)):
+        if i in skip:
+            continue
+        end = a + planner.seconds(seg.window_frames)
+        if end > have + 0.02:
+            out.append(f"Segment {seg.index}'s <Audio> slice ({planner.fmt_time(a)}–{planner.fmt_time(end)}) "
+                       f"runs past the end of the song ({planner.fmt_time(have)}); the rest is silence.")
+    return out
+
+
+def _song_shifts(plan, specs, shots, locks, overlap_frames):
+    """Per piece, frames to add to its window positions to find its place in the
+    song (1.6.17). A Shot's `song_gap` is the seconds of Shots left out of this
+    render right before it: the whole timeline is planned with them in, so every
+    piece takes the song where it really sits. All zeros without gaps."""
+    gaps = [_gap_list(sh.get("song_gap")) for sh in shots]
+    n = len(shots)
+    if not any(gaps):
+        return [0] * n
+    full_specs, at = [], []
+    for i, sp in enumerate(specs):
+        for g in gaps[i]:                     # each left-out Shot as its own piece: the same rounding
+            if isinstance(g, tuple):          # a rendered Shot: its take's exact frames
+                full_specs.append(planner.PieceSpec(planner.seconds(g[1]), g[1], True))
+            else:
+                full_specs.append(planner.PieceSpec(g, None, False))
+        at.append(len(full_specs))
+        full_specs.append(sp)
+    try:
+        full = planner.plan_pieces(full_specs, overlap_frames)
+    except ValueError:
+        full = None
+    shifts, before = [], 0
+    for i in range(n):
+        seg = plan.segments[i]
+        if full is None:                      # rare: a gap too short to plan; whole frames, summed
+            before += sum(g[1] if isinstance(g, tuple) else int(round(g * planner.FPS)) for g in gaps[i])
+            shifts.append(before)
+            continue
+        own = seg.visible_start
+        if i == 0:
+            # the first piece's own content starts at 0, or after the shared zone a take kept
+            m = locks[0]
+            zone = 0
+            if m is not None and m.get("clip") is None and m.get("seconds") not in (None, ""):
+                zone = max(0, int(m["window_frames"]) - int(round(float(m["seconds"]) * planner.FPS)))
+            own = zone
+        shifts.append(full.segments[at[i]].visible_start - own)
+    return shifts
+
+
+def _gap_list(v):
+    """song_gap: each Shot left out right before this one, as "5,5.5,w124": seconds
+    for a Shot not rendered yet, w<frames> for a rendered one (its take's exact
+    window). [] when none."""
+    if v is None or v == "":
+        return []
+    if isinstance(v, (int, float)):
+        return [float(v)] if float(v) > 0 else []
+    out = []
+    for part in str(v).replace(";", ",").split(","):
+        part = part.strip().lower()
+        if not part:
+            continue
+        try:
+            if part.startswith("w"):
+                f = int(part[1:])
+                if not planner.is_valid_frame_count(f):
+                    raise ValueError
+                out.append(("w", f))
+                continue
+            x = float(part)
+        except ValueError:
+            raise ValueError(f"song_gap must be seconds (or w<frames>) separated by commas, got {v!r}") from None
+        if x > 0:
+            out.append(x)
+    return out
+
+
+def _gap_text(v):
+    return ",".join(f"w{g[1]}" if isinstance(g, tuple) else f"{g:g}" for g in _gap_list(v))
+
+
+def _song_map(plan, ids, shifts):
+    """The run's layout for MiniMax H3 Song Cut (1.6.17), carried in Long Shot's
+    LATENT (so ComfyUI's cache keeps it with the result): per piece its window and
+    the frames it shows on the film (from vs), and its shift into the song."""
+    return {"total": plan.total_frames,
+            "pieces": [{"id": ids[i], "ws": seg.window_start, "we": seg.window_end,
+                        "vs": 0 if i == 0 else seg.visible_start, "shift": int(shifts[i])}
+                       for i, seg in enumerate(plan.segments)]}
 
 
 def _pin_audio_at_zero(positive, audio_latent):
@@ -804,7 +982,7 @@ def shared_components(*, model, clip, vae, audio_vae, sampler, sigmas, width, he
     }
 
 
-def segment_components(sp, seed, noise, shared, song):
+def segment_components(sp, seed, noise, shared, song, shift=0):
     """Everything that decides one segment's result, apart from the segments
     before it."""
     seg = sp.segment
@@ -816,7 +994,7 @@ def segment_components(sp, seed, noise, shared, song):
         "length": _digest([seg.window_start, seg.window_frames, seg.overlap_frames,
                            seg.new_frames]),
         "references": shared["references"],
-        "song": _digest(_song_slice(song, seg) if song is not None else None),
+        "song": _digest(_song_slice(song, seg, shift) if song is not None else None),
         "frames": _digest([shared["first"] if sp.first_frame else None,
                            shared["last"] if sp.last_frame else None]),
     }
@@ -1035,14 +1213,28 @@ def run_long_shot(*args, **kwargs):
 
 
 STORE_ROOT = None          # None: <ComfyUI output>/longshot (tests point it elsewhere)
-def _require_audio_vae(refs, audio_vae):
+def _require_audio_vae(refs, audio_vae, song_ref=None):
     """Reference audio is only encoded when a Shot renders, so the audio VAE is
     only required then: a fully locked or reused run never loads it."""
-    if (refs.get("ref_audios") or refs.get("ref_video_audios")) and audio_vae is None:
+    if (refs.get("ref_audios") or refs.get("ref_video_audios") or song_ref is not None) and audio_vae is None:
         raise ValueError("Reference audio is connected — connect the H3 audio VAE to audio_vae.")
 
 
-LAZY_INPUTS = ("model", "clip", "vae", "sigmas", "audio_vae")
+LAZY_INPUTS = ("model", "clip", "vae", "sigmas", "audio_vae", "refine_model")
+REFINE_MODES = ("off", "new takes", "new and locked takes")
+
+
+def refined_name(take, key):
+    """The file name of `take` refined with settings `key` (in takes/refined)."""
+    stem = take[:-len(".safetensors")] if take.endswith(".safetensors") else take
+    sid, seed, _fp = stem.rsplit("__", 2)
+    return disk.TakeStore.take_name(sid, int(seed), _digest([take, "refine", str(key)]))
+
+
+def refined_store(cache_name):
+    store = disk.TakeStore(cache_name, STORE_ROOT)
+    store.folder = os.path.join(store.folder, "refined")
+    return store
 
 
 def _prepare(model, clip, vae, noise, sampler, sigmas, prompt, width, height,
@@ -1050,7 +1242,9 @@ def _prepare(model, clip, vae, noise, sampler, sigmas, prompt, width, height,
              ref_image_size="match", audio_vae=None,
              song=None, first_frame=None, last_frame=None, extra_refs=None, refmods=None,
              ref_images=None, ref_videos=None, ref_video_audios=None, ref_audios=None,
-             save_to_disk=True, cache_name="default", _recipe=None, _planning_only=False):
+             save_to_disk=True, cache_name="default", _recipe=None, _planning_only=False,
+             song_ref=None, refine_model=None, refine_sigmas=None, refine_mode="off", refine_key="",
+             model_name="", refine_model_name=""):
     """Everything up to sampling: checks, plan, prompts, seeds, fingerprints and
     what each segment will do. Shared by the run and by the lazy-input check,
     so both see exactly the same fingerprints."""
@@ -1070,8 +1264,8 @@ def _prepare(model, clip, vae, noise, sampler, sigmas, prompt, width, height,
         "ref_video_audios": {k: v for k, v in (ref_video_audios or {}).items() if v is not None},
         "ref_audios": {k: v for k, v in (ref_audios or {}).items() if v is not None},
     }
-    native_refs = any(refs.values())
-    labels = refmod_labels(refs, refmods)
+    native_refs = any(refs.values()) or song_ref is not None
+    labels = refmod_labels(_with_song(refs, song_ref), refmods)
     if (native_refs or labels) and (first_frame is not None or last_frame is not None):
         raise ValueError(
             "first_frame / last_frame use H3's image-to-video path and can't be combined "
@@ -1090,7 +1284,10 @@ def _prepare(model, clip, vae, noise, sampler, sigmas, prompt, width, height,
             seed_mode=seed_mode, reuse_segments=reuse_segments, ref_image_size=ref_image_size,
             song=song, first_frame=first_frame, last_frame=last_frame, extra_refs=extra_refs,
             refmods=refmods, save_to_disk=save_to_disk, cache_name=cache_name, recipe=_recipe,
-            planning_only=_planning_only)
+            planning_only=_planning_only, song_ref=song_ref,
+            refine=dict(mode=refine_mode if refine_mode in REFINE_MODES else "off",
+                        key=str(refine_key or ""), model_name=str(model_name or ""),
+                        skip=str(refine_model_name or ""), sigmas=refine_sigmas))
 
     plan = planner.plan_from_durations([float(s.get("seconds", 0)) for s in shots],
                                        overlap_frames)
@@ -1110,8 +1307,10 @@ def _prepare(model, clip, vae, noise, sampler, sigmas, prompt, width, height,
             "they're the same RefMods, they go in twice — use one or the other.")
     prompts = planner.build_prompts(
         shots, plan, bundle, reference_mode=native_refs or bool(labels) or bool(extra_blocks),
-        audio_reuse=song is not None,
+        audio_reuse=song is not None or song_ref is not None,
         use_first_frame=first_frame is not None, use_last_frame=last_frame is not None)
+    song_at = _song_ref_at(plan, shots) if song_ref is not None else None
+    plan.warnings.extend(_song_ref_notes(song_ref, plan, song_at or []))
     seeds, own_seeds = segment_seeds(noise, seed_mode, shots)
     shared = shared_components(
         model=model, clip=clip, vae=vae, audio_vae=audio_vae, sampler=sampler,
@@ -1120,6 +1319,10 @@ def _prepare(model, clip, vae, noise, sampler, sigmas, prompt, width, height,
         last_frame=last_frame, recipe=_recipe)
     components = [segment_components(sp, seeds[i], noise, shared, song)
                   for i, sp in enumerate(prompts)]
+    if song_ref is not None:
+        for i, sp in enumerate(prompts):
+            components[i]["song"] = _digest([components[i]["song"], "ref",
+                                             _song_ref_slice(song_ref, song_at[i], sp.segment.window_frames)["waveform"]])
     fingerprints = chain_fingerprints(components)
     # Disk needs a restart-stable fingerprint, so only with a recipe.
     seg_store = (disk.SegmentStore(cache_name, STORE_ROOT)
@@ -1128,7 +1331,8 @@ def _prepare(model, clip, vae, noise, sampler, sigmas, prompt, width, height,
     return SimpleNamespace(plan=plan, prompts=prompts, seeds=seeds, own_seeds=own_seeds,
                            components=components, fingerprints=fingerprints,
                            statuses=statuses, store=seg_store, refs=refs, labels=labels,
-                           extra_blocks=extra_blocks, bundle=bundle, timeline=False)
+                           extra_blocks=extra_blocks, bundle=bundle, timeline=False,
+                           song_ref=song_ref, song_at=song_at)
 
 
 def _window_shapes(seg, width, height):
@@ -1142,18 +1346,23 @@ def _run_long_shot(model, clip, vae, noise, sampler, sigmas, prompt, width, heig
                    ref_image_size="match", audio_vae=None,
                    song=None, first_frame=None, last_frame=None, extra_refs=None, refmods=None,
                    ref_images=None, ref_videos=None, ref_video_audios=None, ref_audios=None,
-                   save_to_disk=True, cache_name="default", _recipe=None):
+                   save_to_disk=True, cache_name="default", _recipe=None, song_ref=None,
+                   refine_model=None, refine_sigmas=None, refine_mode="off", refine_key="",
+                   model_name="", refine_model_name=""):
     """The run, plus the plan as data: ((latent, total_frames, total_seconds, plan), rows)."""
     p = _prepare(model, clip, vae, noise, sampler, sigmas, prompt, width, height,
                  overlap_frames, seed_mode, dry_run, reuse_segments, ref_image_size, audio_vae,
                  song, first_frame, last_frame, extra_refs, refmods, ref_images, ref_videos,
-                 ref_video_audios, ref_audios, save_to_disk, cache_name, _recipe)
+                 ref_video_audios, ref_audios, save_to_disk, cache_name, _recipe, song_ref=song_ref,
+                 refine_model=refine_model, refine_sigmas=refine_sigmas, refine_mode=refine_mode,
+                 refine_key=refine_key, model_name=model_name, refine_model_name=refine_model_name)
     if p.timeline:
         return _run_timeline(p, model=model, clip=clip, vae=vae, audio_vae=audio_vae,
                              noise=noise, sampler=sampler, sigmas=sigmas, width=width,
                              height=height, dry_run=dry_run, reuse_segments=reuse_segments,
                              ref_image_size=ref_image_size, song=song, first_frame=first_frame,
-                             last_frame=last_frame, refmods=refmods)
+                             last_frame=last_frame, refmods=refmods, refine_model=refine_model,
+                             refine_sigmas=refine_sigmas)
     plan, prompts, seeds, own_seeds = p.plan, p.prompts, p.seeds, p.own_seeds
     components, fingerprints, statuses = p.components, p.fingerprints, p.statuses
     refs, labels, extra_blocks, seg_store = p.refs, p.labels, p.extra_blocks, p.store
@@ -1163,14 +1372,15 @@ def _run_long_shot(model, clip, vae, noise, sampler, sigmas, prompt, width, heig
 
     show_seeds = seeds if getattr(noise, "seed", None) is not None else None
     label_text = ""
-    live = native_labels(refs)
+    live = native_labels(_with_song(refs, p.song_ref))
     if live or labels:
-        rows = [f"  {label} = {name}" for label, name in live]
+        rows = [f"  {label} = {name}" + (" (each Shot its own slice of the song)" if name == "song_ref" else "")
+                for label, name in live]
         rows += [f"  {label} = {name} (RefMod)" for label, name, _kind in labels]
         label_text = ("Reference labels — use these in your subject definitions:\n"
                       + "\n".join(rows) + "\n\n")
     plan_args = dict(song_offset=song["offset"] if song is not None else None,
-                     statuses=statuses, own_seeds=own_seeds)
+                     statuses=statuses, own_seeds=own_seeds, song_ref_at=p.song_at)
     report = label_text + planner.render_plan(plan, prompts, show_seeds, **plan_args)
     if seg_store is not None:
         report += f"\nSaved segments: {seg_store.folder}"
@@ -1237,13 +1447,17 @@ def _run_long_shot(model, clip, vae, noise, sampler, sigmas, prompt, width, heig
         logger.info("MiniMax H3 Long Shot: segment %d/%d, %d-frame window, seed %s",
                     seg.index, len(prompts), seg.window_frames, seeds[i])
         if encoder is None:
-            _require_audio_vae(refs, audio_vae)
+            _require_audio_vae(refs, audio_vae, p.song_ref)
             encoder = _RefEncoder(clip, vae, audio_vae, width, height, refs, ref_image_size,
                                   refmods)
 
+        song_ref_cut = (_song_ref_slice(p.song_ref, p.song_at[i], seg.window_frames)
+                        if p.song_ref is not None else None)
         positive = encoder.encode(sp.prompt, seg.window_frames,
                                   first_frame if sp.first_frame else None,
-                                  last_frame if sp.last_frame else None)
+                                  last_frame if sp.last_frame else None,
+                                  song=song_ref_cut,
+                                  song_key=(round(p.song_at[i], 4) if song_ref_cut is not None else None))
         positive = _add_ref_blocks(positive, extra_blocks)
         song_audio = _song_slice(song, seg) if song is not None else None
         if cumulative is None:
@@ -1312,11 +1526,11 @@ def is_timeline(shots):
     return any(isinstance(sh, dict) and sh.get("id") for sh in shots or [])
 
 
-def piece_components(sp, seed, noise, shared, song):
+def piece_components(sp, seed, noise, shared, song, shift=0):
     """segment_components without the window's position: a piece's result
     doesn't depend on where it sits, only on its pins (and its song slice)."""
     seg = sp.segment
-    comps = segment_components(sp, seed, noise, shared, song)
+    comps = segment_components(sp, seed, noise, shared, song, shift)
     comps["length"] = _digest([seg.window_frames, seg.overlap_frames, seg.new_frames])
     return comps
 
@@ -1348,7 +1562,8 @@ def _anchor_latent(vae, image, width, height):
 def _prepare_timeline(*, shots, bundle, refs, labels, native_refs, model, clip, vae, audio_vae,
                       noise, sampler, sigmas, width, height, overlap_frames, seed_mode,
                       reuse_segments, ref_image_size, song, first_frame, last_frame, extra_refs,
-                      refmods, save_to_disk, cache_name, recipe, planning_only):
+                      refmods, save_to_disk, cache_name, recipe, planning_only, song_ref=None,
+                      refine=None):
     from types import SimpleNamespace
     takes = disk.TakeStore(cache_name, STORE_ROOT)
     n = len(shots)
@@ -1422,20 +1637,33 @@ def _prepare_timeline(*, shots, bundle, refs, labels, native_refs, model, clip, 
             int(keep) if keep and planner.is_valid_frame_count(int(keep)) else None)
         specs.append(planner.PieceSpec(float(sh.get("seconds", 0) or 0), window, bool(locks[i])))
     plan = planner.plan_pieces(specs, overlap_frames)
+    shifts = _song_shifts(plan, specs, shots, locks, overlap_frames)
+    for i, sh in enumerate(shots):
+        # 1.6.19: a Shot's song_at places the pinned song too (frames on the song's grid)
+        v = sh.get("song_at")
+        try:
+            v = float(v) if v is not None and v != "" else None
+        except (TypeError, ValueError):
+            v = None
+        if v is not None and v >= 0:
+            shifts[i] = int(round(v * planner.FPS)) - plan.segments[i].window_start
     if song is not None:
-        need, have = plan.total_audio_tokens, song["latent"].shape[-1]
+        need = max(planner.audio_at(seg.window_end + shifts[i]) for i, seg in enumerate(plan.segments))
+        have = song["latent"].shape[-1]
         if have < need:
             raise ValueError(
-                f"The song covers {have / planner.AUDIO_LATENT_FPS:.2f}s but the shots add up to "
-                f"{planner.seconds(plan.total_frames):.2f}s. Shorten the shots or give Song "
+                f"The song covers {have / planner.AUDIO_LATENT_FPS:.2f}s but the Shots reach "
+                f"{need / planner.AUDIO_LATENT_FPS:.2f}s into it. Shorten the Shots or give Song "
                 f"Track a longer duration.")
 
     extra_blocks = _extra_ref_blocks(extra_refs) if not planning_only else \
         [b for e in (extra_refs or []) for b in (e[1].get("minimax_refs", []) or [])]
     prompts = planner.build_prompts(
         shots, plan, bundle, reference_mode=native_refs or bool(labels) or bool(extra_blocks),
-        audio_reuse=song is not None,
+        audio_reuse=song is not None or song_ref is not None,
         use_first_frame=first_frame is not None, use_last_frame=last_frame is not None)
+    song_at = _song_ref_at(plan, shots, shifts) if song_ref is not None else None
+    plan.warnings.extend(_song_ref_notes(song_ref, plan, song_at or [], skip={i for i, m in enumerate(locks) if m}))
     seeds, own_seeds = segment_seeds(noise, seed_mode, shots)
     for i, m in enumerate(locks):
         if m is not None and m.get("seed") is not None:
@@ -1447,7 +1675,37 @@ def _prepare_timeline(*, shots, bundle, refs, labels, native_refs, model, clip, 
         sigmas=sigmas, width=width, height=height, refs=refs, ref_image_size=ref_image_size,
         refmods=refmods, extra_blocks=extra_blocks, first_frame=first_frame,
         last_frame=last_frame, recipe=recipe)
-    comps = [piece_components(sp, seeds[i], noise, shared, song) for i, sp in enumerate(prompts)]
+    comps = [piece_components(sp, seeds[i], noise, shared, song, shifts[i]) for i, sp in enumerate(prompts)]
+    # 1.7.0: the refine pass. New takes are refined right after they're sampled (unless the
+    # main model is the refine model); in "new and locked takes", locked takes are too,
+    # in film order, unless made with the refine model or already refined this way.
+    refine = dict(refine or {})
+    rmode = refine.get("mode") or "off"
+    rkey, rskip, mname = refine.get("key", ""), refine.get("skip", ""), refine.get("model_name", "")
+    refine_new = rmode != "off" and refine.get("sigmas") is not None and not (mname and rskip and mname == rskip)
+    if refine_new:
+        for i in range(n):
+            if kinds[i] != "clip":
+                comps[i]["model"] = _digest([comps[i]["model"], "refine", rkey])
+    refine_locked = [False] * n
+    refined_have = [False] * n
+    rstore = refined_store(cache_name) if rmode == "new and locked takes" else None
+    if rstore is not None and refine.get("sigmas") is not None:
+        for i, m in enumerate(locks):
+            if m is None or kinds[i] == "clip":
+                continue
+            if rskip and m.get("model") == rskip:
+                continue                    # made with the refine model: left as it is
+            if rkey and m.get("refine") == rkey:
+                continue                    # refined this way when it was rendered
+            refine_locked[i] = True
+            refined_have[i] = rstore.exists(refined_name(m["name"], rkey))
+    if song_ref is not None:
+        # 1.6.18: a Shot's slice of the song is part of what it is
+        for i, sp in enumerate(prompts):
+            if kinds[i] != "clip":
+                comps[i]["song"] = _digest([comps[i]["song"], "ref", _song_ref_slice(
+                    song_ref, song_at[i], sp.segment.window_frames)["waveform"]])
     # frame anchors (images the Shot starts from / ends on) and its context
     # image (a reference only, never pinned) are part of what it is
     anchors = [(sh.get("start_image"), sh.get("end_image"), sh.get("context_image"))
@@ -1579,7 +1837,10 @@ def _prepare_timeline(*, shots, bundle, refs, labels, native_refs, model, clip, 
         components=comps, fingerprints=fps, statuses=statuses, store=takes, refs=refs,
         labels=labels, extra_blocks=extra_blocks, bundle=bundle, ids=ids, joins=joins,
         locks=locks, starts=starts, ends=ends, seams=seams, legacy=legacy, prevs=prevs, kinds=kinds,
-        take_names=take_names, save=save_to_disk, recipe=recipe, overlap=ov, anchors=anchors)
+        take_names=take_names, save=save_to_disk, recipe=recipe, overlap=ov, anchors=anchors,
+        song_shifts=shifts, song_ref=song_ref, song_at=song_at,
+        refine=dict(mode=rmode, key=rkey, skip=rskip, model_name=mname, new=refine_new,
+                    locked=refine_locked, have=refined_have, store=rstore))
 
 
 def _pin_identity(pin):
@@ -1615,6 +1876,10 @@ def timeline_rows(p, show_seeds=True):
             "take": p.take_names[i],
             "join": p.joins[i],
             "seam": p.seams[i],
+            # 1.6.17: where this piece's window starts in the song, in seconds (Shots left
+            # out of the render included), so a take can be given its song later on
+            "song_at": round(planner.seconds(p.plan.segments[i].window_start
+                                             + (getattr(p, "song_shifts", None) or [0] * len(rows))[i]), 6),
             "pins": {
                 "start": {"from": st["from"] + 1} if st else None,
                 "end": ({"to": en["to"] + 1, "kind": en["kind"], "take": en["take"]}
@@ -1645,25 +1910,36 @@ def _load_take(p, name, i=None):
 
 def _run_timeline(p, *, model, clip, vae, audio_vae, noise, sampler, sigmas, width, height,
                   dry_run, reuse_segments, ref_image_size, song, first_frame, last_frame,
-                  refmods):
+                  refmods, refine_model=None, refine_sigmas=None):
     plan, prompts, seeds = p.plan, p.prompts, p.seeds
     n = len(prompts)
     ov = p.overlap
     ovt = planner.video_tokens(ov)
     show_seeds = seeds if getattr(noise, "seed", None) is not None else None
     label_text = ""
-    live = native_labels(p.refs)
+    live = native_labels(_with_song(p.refs, getattr(p, "song_ref", None)))
     if live or p.labels:
-        rows = [f"  {label} = {name}" for label, name in live]
+        rows = [f"  {label} = {name}" + (" (each Shot its own slice of the song)" if name == "song_ref" else "")
+                for label, name in live]
         rows += [f"  {label} = {name} (RefMod)" for label, name, _kind in p.labels]
         label_text = ("Reference labels — use these in your subject definitions:\n"
                       + "\n".join(rows) + "\n\n")
     text_status = []
+    R0 = getattr(p, "refine", None) or {}
     for i, s in enumerate(p.statuses):
         extra = _pin_text(p, i)
+        if p.kinds[i] != "clip":
+            if s.startswith("will render") and R0.get("new"):
+                extra = (extra + " · " if extra else "") + "refined after"
+            elif R0.get("locked") and R0["locked"][i]:
+                extra = (extra + " · " if extra else "") + ("refined (kept)" if R0["have"][i] else "will be refined")
         text_status.append(s + (f" · {extra}" if extra else ""))
     plan_args = dict(song_offset=song["offset"] if song is not None else None,
-                     statuses=text_status, own_seeds=p.own_seeds)
+                     statuses=text_status, own_seeds=p.own_seeds,
+                     song_ref_at=getattr(p, "song_at", None),
+                     song_pin_at=[planner.seconds(seg.window_start + int(sh)) for seg, sh in
+                                  zip(plan.segments, getattr(p, "song_shifts", None) or [0] * n)]
+                     if song is not None else None)
     report = label_text + planner.render_plan(plan, prompts, show_seeds, **plan_args)
     report += f"\nTakes: {p.store.folder}"
     logger.info("\n%s%s", label_text, planner.render_plan(
@@ -1716,8 +1992,119 @@ def _run_timeline(p, *, model, clip, vae, audio_vae, noise, sampler, sigmas, wid
             return p.locks[st["from"]]["tail"]
         return disk.slice_hash(placed[st["from"]][0][:, :, -ovt:])
 
-    def song_span(f0, f1):
+    shifts = getattr(p, "song_shifts", None) or [0] * n
+
+    def song_span(f0, f1, shift=0):
+        if shift:
+            return _song_tokens(song, planner.audio_at(f0 + shift), planner.audio_at(f1) - planner.audio_at(f0))
         return song["latent"][..., planner.audio_at(f0):planner.audio_at(f1)].clone()
+
+    def need_encoder(i, what="render"):
+        nonlocal encoder, checked
+        if clip is None or vae is None:
+            raise RuntimeError(
+                f"{_shot_label(i)} has to {what}, but the model wasn't loaded because the plan "
+                f"expected to reuse it (a take may have been deleted while the run started). "
+                f"Queue again.")
+        if not checked:
+            _native()
+            _require_arbitrary_guides()
+            checked = True
+        if encoder is None:
+            _require_audio_vae(p.refs, audio_vae, getattr(p, "song_ref", None))
+            encoder = _RefEncoder(clip, vae, audio_vae, width, height, p.refs, ref_image_size,
+                                  refmods)
+
+    def condition(i, en):
+        """Piece i's conditioning: its prompt and references, frame anchors, the frames it
+        continues from (as placed now) and, with `en`, the frames it has to end on."""
+        seg = plan.segments[i]
+        song_ref = getattr(p, "song_ref", None)
+        sp = prompts[i]
+        a0, a1, cx = p.anchors[i] if getattr(p, "anchors", None) else (None, None, None)
+        song_ref_cut = (_song_ref_slice(song_ref, p.song_at[i], seg.window_frames)
+                        if song_ref is not None else None)
+        positive = encoder.encode(sp.prompt, seg.window_frames,
+                                  first_frame if sp.first_frame else None,
+                                  last_frame if sp.last_frame else None,
+                                  extra_images=[a0, a1, cx], song=song_ref_cut,
+                                  song_key=(round(p.song_at[i], 4) if song_ref_cut is not None else None))
+        positive = _add_ref_blocks(positive, p.extra_blocks)
+        st = p.starts[i]
+        anchor_kfs = []
+        if a0 is not None and st is None:
+            # the Shot's own content begins at the end of its shared zone (frame 0 when it has none)
+            anchor_kfs.append({"resolved_frame_index": max(0, seg.overlap_frames - 1),
+                               "latent": _anchor_latent(vae, a0, width, height)})
+        if a1 is not None and en is None:
+            anchor_kfs.append({"resolved_frame_index": seg.window_frames - 1,
+                               "latent": _anchor_latent(vae, a1, width, height)})
+        if anchor_kfs:
+            positive = _set_keyframes(positive, _keyframes(positive) + anchor_kfs)
+        kfs = _keyframes(positive)
+        if st is not None:
+            lv = placed[st["from"]][0]
+            for k in kfs:
+                if 0 <= float(k["resolved_frame_index"]) < ov:
+                    raise ValueError(f"{_shot_label(i)} already has a guide inside its shared "
+                                     f"zone, which would fight the continuation.")
+            kfs.append({"resolved_frame_index": 0,
+                        "latent": lv[:, :, -ovt:].clone(),
+                        "audio_latent": (song_span(seg.window_start, seg.window_end, shifts[i])
+                                         if song is not None else zone_audio(st["from"], True).clone())})
+        elif song is not None:
+            positive = _pin_audio_at_zero(positive, song_span(seg.window_start, seg.window_end, shifts[i]))
+            kfs = _keyframes(positive)
+        end_v = end_a = None
+        if en is not None:
+            # The zone's audio is exactly what the neighbour drops (or showed),
+            # counted by global position.
+            n_tail = planner.tail_audio_tokens(seg, ov)
+            if en["kind"] == "old_tail":
+                ov_v, ov_a, _ov_meta = _load_take(p, en["take"])
+                end_v = ov_v[:, :, -ovt:]
+                end_a = ov_a[..., -n_tail:]
+            else:
+                rv, ra, _r_meta = _load_take(p, en["take"])
+                end_v = rv[:, :, :ovt]
+                end_a = ra[..., :n_tail]
+            end_a = _fit_audio(end_a, n_tail)
+            ref_dtype = placed[st["from"]][0] if st is not None else None
+            end_v = end_v.to(ref_dtype) if ref_dtype is not None else end_v.float()
+            end_a = end_a.to(end_v.dtype)
+            end_guide = {"resolved_frame_index": seg.window_frames - ov, "latent": end_v.clone()}
+            if song is None:
+                end_guide["audio_latent"] = end_a.clone()
+            kfs.append(end_guide)
+        if kfs:
+            positive = _set_keyframes(positive, kfs)
+        return positive, end_v, end_a
+
+    R = getattr(p, "refine", None) or {}
+
+    def refine_window(i, positive, v, a, end_v, end_a):
+        """1.7.0: resample piece i with the refine model from where it is, with the same
+        conditioning (so it still continues and ends where it has to)."""
+        if refine_model is None or refine_sigmas is None:
+            raise RuntimeError(f"{_shot_label(i)} has to be refined, but the refine model "
+                               "wasn't loaded. Queue again.")
+        progress(i, "refining")
+        out = _sample_window(refine_model, _segment_noise(noise, seeds[i]), sampler, refine_sigmas,
+                             positive, {"samples": NestedTensor((v.float(), a.float()))})
+        rv, ra = out["samples"].tensors
+        if end_v is not None:
+            rv, ra = rv.clone(), ra.clone()
+            rv[:, :, -ovt:] = end_v.to(rv)
+            ra[..., -end_a.shape[-1]:] = end_a.to(ra)
+        return rv, ra
+
+    def next_pin(i):
+        """A locked neighbour after i that stays as it is: refined i still ends on its head."""
+        r = i + 1
+        if r < n and p.locks[r] and p.kinds[r] != "clip" and p.joins[r] == "bridge" and \
+                not (R.get("locked") and R["locked"][r]):
+            return {"to": r, "kind": "head", "take": p.locks[r]["name"], "hash": p.locks[r]["head"]}
+        return None
 
     for i in range(n):
         seg = plan.segments[i]
@@ -1725,8 +2112,31 @@ def _run_timeline(p, *, model, clip, vae, audio_vae, noise, sampler, sigmas, wid
         status = p.statuses[i]
         if status in ("locked", "clip"):
             v, a, _meta = _load_take(p, p.locks[i]["name"], i)
+            source = "clip" if status == "clip" else "take"
+            if status == "locked" and R.get("locked") and R["locked"][i]:
+                # 1.7.0: refined in film order, kept in takes/refined and reused
+                rname = refined_name(p.locks[i]["name"], R["key"])
+                got_r = None
+                if R["have"][i]:
+                    try:
+                        got_r = R["store"].load(rname)[:2]
+                    except (OSError, ValueError):
+                        got_r = None
+                if got_r is None:
+                    need_encoder(i, "be refined")
+                    positive, end_v, end_a = condition(i, next_pin(i))
+                    got_r = refine_window(i, positive, v, a, end_v, end_a)
+                    md = {k: val for k, val in (p.locks[i] or {}).items() if k not in ("name", "bytes")}
+                    md.update(refine=R["key"], refined_from=p.locks[i]["name"])
+                    try:
+                        R["store"].save(rname, got_r[0], got_r[1], md)
+                    except Exception as err:   # a full disk mustn't cost the run
+                        logger.warning("MiniMax H3 Long Shot: couldn't save %s's refined take: %s",
+                                       _shot_label(i), err)
+                v, a = got_r
+                source = "refined take"
             place(i, v, a)
-            progress(i, "reused", "clip" if status == "clip" else "take")
+            progress(i, "reused", source)
             continue
         fp = p.fingerprints[i]
         got = None
@@ -1753,77 +2163,12 @@ def _run_timeline(p, *, model, clip, vae, audio_vae, noise, sampler, sigmas, wid
             continue
 
         # --- render -----------------------------------------------------------
-        if clip is None or vae is None:
-            raise RuntimeError(
-                f"{_shot_label(i)} has to render, but the model wasn't loaded because the plan "
-                f"expected to reuse it (a take may have been deleted while the run started). "
-                f"Queue again.")
-        if not checked:
-            _native()
-            _require_arbitrary_guides()
-            checked = True
+        need_encoder(i)
         progress(i, "rendering")
         logger.info("MiniMax H3 Long Shot: %s, %d-frame window, seed %s", _shot_label(i),
                     seg.window_frames, seeds[i])
-        if encoder is None:
-            _require_audio_vae(p.refs, audio_vae)
-            encoder = _RefEncoder(clip, vae, audio_vae, width, height, p.refs, ref_image_size,
-                                  refmods)
-        sp = prompts[i]
-        a0, a1, cx = p.anchors[i] if getattr(p, "anchors", None) else (None, None, None)
-        positive = encoder.encode(sp.prompt, seg.window_frames,
-                                  first_frame if sp.first_frame else None,
-                                  last_frame if sp.last_frame else None,
-                                  extra_images=[a0, a1, cx])
-        positive = _add_ref_blocks(positive, p.extra_blocks)
+        positive, end_v, end_a = condition(i, p.ends[i])
         st, en = p.starts[i], p.ends[i]
-        anchor_kfs = []
-        if a0 is not None and st is None:
-            # the Shot's own content begins at the end of its shared zone (frame 0 when it has none)
-            anchor_kfs.append({"resolved_frame_index": max(0, seg.overlap_frames - 1),
-                               "latent": _anchor_latent(vae, a0, width, height)})
-        if a1 is not None and en is None:
-            anchor_kfs.append({"resolved_frame_index": seg.window_frames - 1,
-                               "latent": _anchor_latent(vae, a1, width, height)})
-        if anchor_kfs:
-            positive = _set_keyframes(positive, _keyframes(positive) + anchor_kfs)
-        kfs = _keyframes(positive)
-        if st is not None:
-            lv = placed[st["from"]][0]
-            for k in kfs:
-                if 0 <= float(k["resolved_frame_index"]) < ov:
-                    raise ValueError(f"{_shot_label(i)} already has a guide inside its shared "
-                                     f"zone, which would fight the continuation.")
-            kfs.append({"resolved_frame_index": 0,
-                        "latent": lv[:, :, -ovt:].clone(),
-                        "audio_latent": (song_span(seg.window_start, seg.window_end)
-                                         if song is not None else zone_audio(st["from"], True).clone())})
-        elif song is not None:
-            positive = _pin_audio_at_zero(positive, song_span(seg.window_start, seg.window_end))
-            kfs = _keyframes(positive)
-        end_v = end_a = None
-        if en is not None:
-            # The zone's audio is exactly what the neighbour drops (or showed),
-            # counted by global position.
-            n_tail = planner.tail_audio_tokens(seg, ov)
-            if en["kind"] == "old_tail":
-                ov_v, ov_a, _ov_meta = _load_take(p, en["take"])
-                end_v = ov_v[:, :, -ovt:]
-                end_a = ov_a[..., -n_tail:]
-            else:
-                rv, ra, _r_meta = _load_take(p, en["take"])
-                end_v = rv[:, :, :ovt]
-                end_a = ra[..., :n_tail]
-            end_a = _fit_audio(end_a, n_tail)
-            ref_dtype = placed[st["from"]][0] if st is not None else None
-            end_v = end_v.to(ref_dtype) if ref_dtype is not None else end_v.float()
-            end_a = end_a.to(end_v.dtype)
-            end_guide = {"resolved_frame_index": seg.window_frames - ov, "latent": end_v.clone()}
-            if song is None:
-                end_guide["audio_latent"] = end_a.clone()
-            kfs.append(end_guide)
-        if kfs:
-            positive = _set_keyframes(positive, kfs)
         like = placed[st["from"]][0] if st is not None else None
         target = _empty_window(width, height, seg, like=like)
         sampled = _sample_window(model, _segment_noise(noise, seeds[i]),
@@ -1835,6 +2180,9 @@ def _run_timeline(p, *, model, clip, vae, audio_vae, noise, sampler, sigmas, wid
             a = a.clone()
             v[:, :, -ovt:] = end_v.to(v)
             a[..., -end_a.shape[-1]:] = end_a.to(a)
+            sampled = {"samples": NestedTensor((v, a))}
+        if R.get("new"):
+            v, a = refine_window(i, positive, v, a, end_v, end_a)
             sampled = {"samples": NestedTensor((v, a))}
         _LAST_TIMELINE[p.ids[i]] = {"comps": p.components[i], "start": p.prevs[i],
                                     "end": _pin_identity(en)}
@@ -1853,8 +2201,18 @@ def _run_timeline(p, *, model, clip, vae, audio_vae, noise, sampler, sigmas, wid
             f"Stitched latent is {v.shape[2]} video / {a.shape[-1]} audio tokens; expected "
             f"{plan.total_video_tokens} / {plan.total_audio_tokens}.")
     if song is not None:
-        a = song["latent"][..., :plan.total_audio_tokens].to(a)
+        if any(shifts):
+            # each piece's shown part from its own place in the song (1.6.17)
+            parts = []
+            for i, seg in enumerate(plan.segments):
+                f0 = 0 if i == 0 else seg.visible_start
+                t0, t1 = planner.audio_at(f0), planner.audio_at(seg.window_end)
+                parts.append(_song_tokens(song, planner.audio_at(f0 + shifts[i]), t1 - t0))
+            a = torch.cat(parts, -1)[..., :plan.total_audio_tokens].to(a)
+        else:
+            a = song["latent"][..., :plan.total_audio_tokens].to(a)
         cumulative = {"samples": NestedTensor((v, a))}
+    cumulative["mmh3_song_map"] = _song_map(plan, p.ids, shifts)
     spans = []
     for i, seg in enumerate(plan.segments):
         if p.kinds[i] == "clip":
@@ -1896,6 +2254,9 @@ def _keep_take(p, i, video, audio, left_tail=""):
         "end_src": en["hash"] if en else "",
         "seconds": round(planner.seconds(seg.new_frames), 4),
     }
+    R = getattr(p, "refine", None) or {}
+    meta["model"] = R.get("model_name", "")              # 1.7.0: what made it, and its refine
+    meta["refine"] = R.get("key", "") if R.get("new") else ""
     try:
         p.store.save(name, video, audio, meta)
     except Exception as err:   # a full disk mustn't cost the render
@@ -1931,8 +2292,13 @@ def lazy_requests(kwargs, prompt, unique_id):
         p = _prepare(**args, _recipe=recipe, _planning_only=True)
     except Exception:       # let the run itself report the problem
         return wanted
-    return [] if all(s.startswith("reused") or s.startswith("locked") or s == "clip"
-                     for s in p.statuses) else wanted
+    if all(s.startswith("reused") or s.startswith("locked") or s == "clip" for s in p.statuses):
+        # 1.7.0: locked takes still to refine need the text encoder, VAEs and the refine model
+        R = getattr(p, "refine", None) or {}
+        if any(lk and not hv for lk, hv in zip(R.get("locked") or [], R.get("have") or [])):
+            return [x for x in ("clip", "vae", "audio_vae", "refine_model") if x in wanted]
+        return []
+    return wanted
 
 
 def _schema_extras(io):
@@ -2010,6 +2376,11 @@ def _make_long_shot_node():
                     io.Custom("MMH3_SONG").Input(
                         "song", optional=True, tooltip="From MiniMax H3 Song Track. Each segment "
                         "gets its exact slice of the song pinned to its timeline for lip sync."),
+                    io.Audio.Input(
+                        "song_ref", optional=True, tooltip="1.6.18: a song as reference audio, the "
+                        "way the native Reference to Video node takes it. Each Shot gets its own "
+                        "slice (its song_at, or where its window sits on the timeline) as the first "
+                        "standalone <Audio N>, before ref_audios. Needs audio_vae."),
                     io.Image.Input("first_frame", optional=True,
                                    tooltip="Opening frame for segment 1. Can't be combined with "
                                    "reference inputs."),
@@ -2026,7 +2397,27 @@ def _make_long_shot_node():
                         "MiniMax H3 RefMod Carrier → Apply H3 RefMod, for Apply's retention and "
                         "curve controls. These get no label in the prompt; use refmods for "
                         "RefMods your prompt refers to."),
-                ] + _ref_inputs(io),
+                ] + _ref_inputs(io) + [
+                    # 1.7.0: a refine pass (e.g. the fl2va model over a ref2va take)
+                    io.Model.Input("refine_model", optional=True, lazy=True,
+                                   tooltip="1.7.0: the model of the refine pass (with its own model "
+                                   "sampling / LoRA). Each take is resampled with it at refine_sigmas."),
+                    io.Sigmas.Input("refine_sigmas", optional=True,
+                                    tooltip="Sigmas of the refine pass: a BasicScheduler with denoise "
+                                    "below 1 (e.g. 0.3) on the refine model."),
+                    io.Combo.Input("refine_mode", options=list(REFINE_MODES), default="off", optional=True,
+                                   tooltip="off · new takes: each Shot is refined right after it's "
+                                   "sampled (the refined take is the take) · new and locked takes: "
+                                   "also refines locked takes in film order (kept in takes/refined)."),
+                    io.String.Input("refine_key", default="", optional=True,
+                                    tooltip="What identifies the refine settings (H3 Long Shot Studio "
+                                    "sets it); a refined take is reused while it's the same."),
+                    io.String.Input("model_name", default="", optional=True,
+                                    tooltip="The main model's file name, recorded in each take."),
+                    io.String.Input("refine_model_name", default="", optional=True,
+                                    tooltip="The refine model's file name: takes made with it are "
+                                    "never refined."),
+                ],
                 outputs=[
                     io.Latent.Output(display_name="latent"),
                     io.Int.Output(display_name="total_frames"),
@@ -2107,6 +2498,8 @@ class MiniMaxH3TimelineShot:
                                   "only (the next <Picture N>, after the frame anchors), never "
                                   "pinned. E.g. the last frame of the Shot before, with join "
                                   "'cut': a new angle that keeps the scene's continuity."}),
+                "song_gap": ("STRING", {"default": "", "tooltip": "The seconds of each Shot left out of this render right before this one, e.g. '5,5,4.5'. With a song, this Shot still takes the song where it sits on the whole timeline (lip sync stays in place). Empty: none."}),
+                "song_at": ("FLOAT", {"default": -1.0, "min": -1.0, "max": 100000.0, "step": 0.001, "tooltip": "1.6.18, with song_ref: where this Shot's window starts in the song, in seconds. -1: where it sits on this timeline."}),
                 "retention": ("STRING", {"multiline": True, "default": "", "tooltip": "Extra "
                               "retention_analysis lines for this Shot only, added after the shared "
                               "ones. E.g. '<Picture 4> (reference for [Shot 1]): weak_reference - …' "
@@ -2120,7 +2513,8 @@ class MiniMaxH3TimelineShot:
     CATEGORY = "MiniMax H3"
 
     def add(self, shot_id, seconds, text, shot_seed=-1, lock="", join="bridge", frames=0,
-            shots=None, start_image=None, end_image=None, context_image=None, retention=""):
+            shots=None, start_image=None, end_image=None, context_image=None, retention="",
+            song_gap="", song_at=-1.0):
         chain = list(shots) if shots else []
         if not str(shot_id).strip():
             logger.warning("MiniMax H3 Timeline Shot %d has no shot_id; it is filed as shot%d, "
@@ -2148,6 +2542,10 @@ class MiniMaxH3TimelineShot:
             chain[-1]["context_image"] = context_image[-1:]
         if str(retention or "").strip():       # only when given, so older chains keep their prompts
             chain[-1]["retention"] = str(retention).strip()
+        if _gap_list(song_gap):                # 1.6.17: only when given
+            chain[-1]["song_gap"] = _gap_text(song_gap)
+        if song_at is not None and float(song_at) >= 0:   # 1.6.18: only when given
+            chain[-1]["song_at"] = round(float(song_at), 4)
         return (chain,)
 
 
@@ -2235,7 +2633,9 @@ class MiniMaxH3ClipShot:
                 "join": (["bridge", "cut"], {"default": "bridge", "tooltip": "How the clip joins "
                          "the piece before it."}),
             },
-            "optional": {"shots": ("MMH3_SHOTS",)},
+            "optional": {"shots": ("MMH3_SHOTS",),
+                         "song_gap": ("STRING", {"default": "", "tooltip": "The seconds of each Shot left out of this render right before this one, e.g. '5,5,4.5'. With a song, this Shot still takes the song where it sits on the whole timeline (lip sync stays in place). Empty: none."}),
+                "song_at": ("FLOAT", {"default": -1.0, "min": -1.0, "max": 100000.0, "step": 0.001, "tooltip": "1.6.18, with song_ref: where this clip's window starts in the song, in seconds. -1: where it sits on this timeline."}),},
         }
 
     RETURN_TYPES = ("MMH3_SHOTS",)
@@ -2243,7 +2643,7 @@ class MiniMaxH3ClipShot:
     FUNCTION = "add"
     CATEGORY = "MiniMax H3"
 
-    def add(self, clip, shot_id, join="bridge", shots=None):
+    def add(self, clip, shot_id, join="bridge", shots=None, song_gap="", song_at=-1.0):
         chain = list(shots) if shots else []
         chain.append({
             "kind": "clip",
@@ -2257,6 +2657,10 @@ class MiniMaxH3ClipShot:
             "frames": clip["frames"],
             "clip": clip,
         })
+        if _gap_list(song_gap):
+            chain[-1]["song_gap"] = _gap_text(song_gap)
+        if song_at is not None and float(song_at) >= 0:
+            chain[-1]["song_at"] = round(float(song_at), 4)
         return (chain,)
 
 
@@ -2312,6 +2716,8 @@ class MiniMaxH3Take:
             "shot_id": ("STRING", {"default": ""}),
             "after": ("INT", {"forceInput": True, "tooltip": "Long Shot's total_frames, so this "
                               "runs after it."}),
+            "refine": ("STRING", {"default": "", "tooltip": "1.7.0: a refine key: the take refined "
+                                  "that way (takes/refined) when there is one, else the take."}),
         }}
 
     RETURN_TYPES = ("LATENT", "INT")
@@ -2320,16 +2726,23 @@ class MiniMaxH3Take:
     CATEGORY = "MiniMax H3"
 
     @classmethod
-    def IS_CHANGED(cls, cache_name="default", take="", shot_id="", after=None):
+    def IS_CHANGED(cls, cache_name="default", take="", shot_id="", after=None, refine=""):
         # a Shot id means "whatever take the last run gave it": always look again
-        return take if take else float("nan")
+        if not take:
+            return float("nan")
+        return take if not refine else float("nan")      # a refined version may appear later
 
-    def load(self, cache_name="default", take="", shot_id="", after=None):
+    def load(self, cache_name="default", take="", shot_id="", after=None, refine=""):
         store = disk.TakeStore(cache_name, STORE_ROOT)
         name = take or _LAST_TAKES.get(store.name, {}).get(str(shot_id))
         if not name:
             raise ValueError(f"No take for Shot {shot_id!r}: run Long Shot first (wire its "
                              "total_frames into 'after'), or give the take's file name.")
+        if refine:
+            rstore = refined_store(cache_name)
+            rname = refined_name(name, refine)
+            if rstore.exists(rname):
+                store, name = rstore, rname
         try:
             video, audio, meta = store.load(name)
         except FileNotFoundError:
@@ -2954,8 +3367,66 @@ class MiniMaxH3LoadVideo:
         return (images, count, {"waveform": wave.unsqueeze(0), "sample_rate": rate})
 
 
+class MiniMaxH3SongCut:
+    """The song (the original audio, not the H3 re-encode) cut to what Long Shot
+    rendered: the whole film, each piece from its own place in the song, or one
+    Shot's take window. For "song instead of H3's audio" on the film and on each
+    take's clip, in step with lip sync when Shots were left out of the render (1.6.17)."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "audio": ("AUDIO", {"tooltip": "The song, trimmed to where the film starts (as "
+                                    "for Song Track)."}),
+                "latent": ("LATENT", {"tooltip": "MiniMax H3 Long Shot's latent: the layout comes "
+                                      "with it."}),
+            },
+            "optional": {
+                "shot_id": ("STRING", {"default": "", "tooltip": "A Shot's id: its take's window "
+                            "(as MiniMax H3 Take decodes it). Empty: the whole film."}),
+            },
+        }
+
+    RETURN_TYPES = ("AUDIO",)
+    RETURN_NAMES = ("audio",)
+    FUNCTION = "cut"
+    CATEGORY = "MiniMax H3"
+
+    def cut(self, audio, latent, shot_id=""):
+        m = latent.get("mmh3_song_map") if isinstance(latent, dict) else None
+        if not m:
+            raise ValueError("Connect MiniMax H3 Long Shot's latent (timeline mode, 1.6.17 or later).")
+        wave, sr = audio["waveform"], int(audio["sample_rate"])
+        if wave.dim() == 2:
+            wave = wave.unsqueeze(0)
+        fps = planner.FPS
+
+        def at(frame):
+            return int(round(frame * sr / fps))
+
+        def song(f_song, n):
+            s0 = at(f_song)
+            part = wave[..., max(0, s0):max(0, s0) + n]
+            if part.shape[-1] < n:
+                part = torch.cat([part, wave.new_zeros(*wave.shape[:-1], n - part.shape[-1])], -1)
+            return part
+
+        sid = str(shot_id or "").strip()
+        if sid:
+            pc = next((x for x in m["pieces"] if str(x["id"]) == sid), None)
+            if pc is None:
+                raise ValueError(f"Shot {sid!r} isn't in this Long Shot run.")
+            out = song(pc["ws"] + pc["shift"], at(pc["we"]) - at(pc["ws"]))
+        else:
+            out = torch.cat([song(pc["vs"] + pc["shift"], at(pc["we"]) - at(pc["vs"]))
+                             for pc in m["pieces"]], -1)
+        return ({"waveform": out.contiguous(), "sample_rate": sr},)
+
+
 NODE_CLASS_MAPPINGS = {
     "MiniMaxH3Take": MiniMaxH3Take,
+    "MiniMaxH3SongCut": MiniMaxH3SongCut,
     "MiniMaxH3SongTrack": MiniMaxH3SongTrack,
     "MiniMaxH3RefModCarrier": MiniMaxH3RefModCarrier,
     "MiniMaxH3TimelineShot": MiniMaxH3TimelineShot,
@@ -2974,6 +3445,7 @@ else:
     logger.error("MiniMax H3 Long Shot needs a newer ComfyUI (V3 node API). Update ComfyUI.")
 NODE_DISPLAY_NAME_MAPPINGS = {
     "MiniMaxH3Take": "MiniMax H3 Take",
+    "MiniMaxH3SongCut": "MiniMax H3 Song Cut",
     "MiniMaxH3LongShot": "MiniMax H3 Long Shot",
     "MiniMaxH3SongTrack": "MiniMax H3 Song Track",
     "MiniMaxH3RefModCarrier": "MiniMax H3 RefMod Carrier",
