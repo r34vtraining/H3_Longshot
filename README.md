@@ -1,5 +1,38 @@
 # ComfyUI — MiniMax H3 Long Shot
 
+## What's new in 1.8.1
+
+- **MiniMax H3 Paste Faces**: puts the faces of approved Face refine clips into a decoded film, each over
+  its Shot's frames (`items`: JSON with the clip in the output folder, where its frames go, and the
+  redrawn faces' boxes). Only the area around each face changes, under a soft mask. H3 Long Shot
+  Studio 0.15.0 uses it for Upscale final video.
+- **MiniMax H3 Load Video** no longer pads the end with a few repeated frames on some ffmpeg builds
+  (e.g. imageio-ffmpeg's 7.0).
+
+## What's new in 1.8.0
+
+- **MiniMax H3 Face Refine**: faces too small to come out well are redrawn by H3 as close-ups.
+  - It finds and follows each face over the frames (MTCNN), cuts it out as one steady square
+    (fixed, or slowly following a moving face: `follow`), enlarges it to `work_size` and resamples
+    it with H3 from where it is (`sigmas`: a BasicScheduler with denoise about 0.3 on the redraw
+    model, e.g. the fl2va model with a video shift around 4).
+  - `hold_audio`: the sound of those frames (from `latent`) is held as a guide over the whole
+    window, so the mouth is drawn against the real sound.
+  - The close-up is shrunk back and blended in under a soft face mask (`mask_scale`, `feather`),
+    its broad colour matched to the original (`color_match`). Nothing else changes.
+  - Faces shorter than `max_face` pixels are redrawn (`which`: all or the largest). Without
+    `ref_image` the close-up is conditioned like t2va / fl2va; with one (the ref2va model) that
+    picture is `<Picture 1>`, the face's identity. `text` overrides the standard close-up prompt.
+  - Long videos go in windows of up to `max_window` frames that crossfade. `skip` leaves frame
+    ranges alone.
+  - With `cache_name` and `cache_key`, redrawn close-ups are kept (as latents) in
+    `output/longshot/<project>/faces` and reused while the picture under them, their sound, the
+    prompt, the seed and the settings stay the same.
+  - The model, CLIP, sampler and sigmas are lazy: with no small faces, or every redraw kept, the
+    model isn't loaded. Outputs the images and a JSON report (faces, crops, windows).
+  - The face detector's weights (`pnet.pt`, `rnet.pt`, `onet.pt`, about 2 MB, MIT, from the
+    facenet-pytorch wheel) go in `models/facedetect/mtcnn`. H3 Long Shot Studio downloads them.
+
 ## What's new in 1.7.0
 
 - **A refine pass**, e.g. the sharper fl2va model over takes made with ref2va. New inputs on

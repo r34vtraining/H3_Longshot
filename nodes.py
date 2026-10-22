@@ -3344,7 +3344,8 @@ class MiniMaxH3LoadVideo:
         skip, cap = int(skip_first_frames), int(frame_load_cap)
         trim = f"trim=start_frame={skip}" + (f":end_frame={skip + cap}" if cap else "")
         vf = f"fps={force_rate},{trim},setpts=PTS-STARTPTS,scale={w}:{h}:flags=bicubic"
-        res = subprocess.run([ffmpeg, "-v", "error", "-i", path, "-an", "-vf", vf, "-f", "rawvideo",
+        # 1.8.1: -vsync 0, or some ffmpeg builds pad the end with a few repeated frames
+        res = subprocess.run([ffmpeg, "-v", "error", "-i", path, "-an", "-vf", vf, "-vsync", "0", "-f", "rawvideo",
                               "-pix_fmt", "rgb24", "-"], capture_output=True)
         if res.returncode != 0 or not res.stdout:
             raise RuntimeError("Reading the clip failed: " + (res.stderr or b"").decode("utf-8", "replace")[-400:])
