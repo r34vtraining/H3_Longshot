@@ -1,5 +1,24 @@
 # ComfyUI — MiniMax H3 Long Shot
 
+## What's new in 1.9.0
+
+- **Face swap** in MiniMax H3 Face Refine (`mode: swap`, the ref2va model): each face is given the
+  identity of a ref image, keeping the footage's head movement, expression and mouth. Without regions
+  the largest face found is swapped, whatever its size; with regions (boxes drawn by hand) each box
+  names its picture (`"ref": 1–4`, inputs `ref_image` … `ref_image_4`) and label, under a soft oval.
+  A denoise around 0.6 at video shift 4 and a lower colour match (about 0.4) suit a new identity.
+- **MiniMax H3 Load Video (24 fps)**: any video from ComfyUI's input folder as frames at 24 fps and its
+  sound, for swapping faces in footage that wasn't made with H3.
+
+## What's new in 1.8.2
+
+- **MiniMax H3 Face Refine: regions.** For faces the detector doesn't see (cartoon characters, creatures,
+  a prop), the new `regions` input takes boxes drawn by hand instead:
+  `[{"keys": [[frame, x, y, w, h], ...]}]` with x, y, w, h as fractions of the frame. The box moves in a
+  straight line between key frames. Each region is redrawn whatever its size, as a close-up that follows
+  it, and blended back under a soft rectangle (not the oval face mask). `text` should say what's in it.
+- **MiniMax H3 Paste Faces** keeps a region's rectangle (`shapes`: "rect" per face in an item).
+
 ## What's new in 1.8.1
 
 - **MiniMax H3 Paste Faces**: puts the faces of approved Face refine clips into a decoded film, each over

@@ -20,6 +20,8 @@ logger = logging.getLogger("MiniMaxH3LongShot")
 
 FACE_FOLLOW = ("auto", "fixed", "follow")
 FACE_WHICH = ("all", "largest")
+FACE_MODES = ("refine", "swap")          # 1.9.0: swap: each face becomes the person of its ref image
+REF_INPUTS = ("ref_image", "ref_image_2", "ref_image_3", "ref_image_4")
 AUDIO_PER_FRAME = 40.0 / 24.0          # H3's sound latent runs at 40 Hz, the picture at 24 fps
 _FACE_PLANS = OrderedDict()            # (images identity, settings) -> plan, from the lazy check to the run
 
@@ -43,6 +45,23 @@ def face_prompt(with_ref=False, label="the person", describe=""):
             "hairstyle and skin tone.\n"
             "detailed_description: Cinematic, live-action, realistic. [Shot 1] An extreme close-up of "
             f"<Subject 1>'s face filling most of the frame.{look} {action}\n" + sound)
+
+
+def swap_prompt(label="", describe=""):
+    """1.9.0, face swap: the close-up's text for the ref2va model. The face becomes the one of
+    <Picture 1>; the head pose, expression, eye and mouth movement stay those of the footage."""
+    who = (describe or "").strip().rstrip(".")
+    look = f" {who[0].upper() + who[1:]}." if who else ""
+    name = (label or "").strip() or "the person in <Picture 1>"
+    return (f"subject_definitions: <Subject 1> is {name}, whose face, features, skin tone and hair come from <Picture 1>.\n"
+            "summary: [reference generation] An extreme close-up of <Subject 1>'s face.\n"
+            "retention_analysis: <Subject 1> (appears in [Shot 1]): fully_preserved - the face, identity, facial "
+            "features, skin tone and hair of <Picture 1>.\n"
+            "detailed_description: Cinematic, live-action, realistic. [Shot 1] An extreme close-up of <Subject 1>'s "
+            f"face filling most of the frame: the face of <Picture 1>.{look} <Subject 1> keeps exactly the head "
+            "position, head movement, expression, eye movement and mouth movement of the face in the footage, in time "
+            "with the sound. Sharp natural detail in the eyes, eyelashes, skin texture, lips and teeth. The camera is static.\n"
+            "overall_soundscape: The person's own voice and the room around them, unchanged.\nnon_diegetic_music: N/A")
 
 
 def detector_folder():
@@ -101,6 +120,21 @@ def audio_slice(latent, start, frames):
     return piece.clone()
 
 
+def parse_regions(value):
+    """1.8.2: the regions input as a list (None when there are none: faces are found)."""
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        data = json.loads(text)
+    except ValueError:
+        raise ValueError("MiniMax H3 Face Refine: regions isn't JSON.") from None
+    if isinstance(data, dict):
+        data = [data]
+    data = [r for r in data if isinstance(r, (dict, list)) and (r.get("keys") if isinstance(r, dict) else r)]
+    return data or None
+
+
 class MiniMaxH3FaceRefine:
     """1.8.0: faces too small to come out well are redrawn by H3 as close-ups.
 
@@ -154,7 +188,18 @@ class MiniMaxH3FaceRefine:
             "cache_key": ("STRING", {"default": "", "tooltip": "What identifies the redraw model and its "
                                      "settings (H3 Long Shot Studio sets it)."}),
             "detect_every": ("INT", {"default": 2, "min": 1, "max": 24}),
+            "regions": ("STRING", {"default": "", "multiline": True, "tooltip": "1.8.2: regions drawn by hand "
+                                   "instead of found faces (for faces the detector doesn't see: cartoon characters, "
+                                   "creatures, a prop). JSON [{\"keys\": [[frame, x, y, w, h], ...]}], x y w h as "
+                                   "fractions of the frame; the box moves in a straight line between key frames. "
+                                   "Each region is redrawn whatever its size, under a soft rectangle."}),
             "enabled": ("BOOLEAN", {"default": True}),
+            "mode": (list(FACE_MODES), {"default": "refine", "tooltip": "1.9.0: refine redraws small faces as "
+                     "themselves; swap gives each face the identity of a ref image (the ref2va model): every "
+                     "face whatever its size (largest only unless regions pick them), a higher denoise (about 0.6)."}),
+            "ref_image_2": ("IMAGE", {"tooltip": "1.9.0, swap: the second face's identity (a region with \"ref\": 2)."}),
+            "ref_image_3": ("IMAGE", {"tooltip": "1.9.0, swap: the third face's identity (\"ref\": 3)."}),
+            "ref_image_4": ("IMAGE", {"tooltip": "1.9.0, swap: the fourth face's identity (\"ref\": 4)."}),
         }}
 
     RETURN_TYPES = ("IMAGE", "STRING")
@@ -167,7 +212,8 @@ class MiniMaxH3FaceRefine:
     def _settings(kw):
         return (int(kw.get("max_face", 150)), str(kw.get("which", "all")),
                 round(float(kw.get("padding", 0.8)), 4), str(kw.get("follow", "auto")),
-                int(kw.get("max_window", 362)), str(kw.get("skip", "")), int(kw.get("detect_every", 2)))
+                int(kw.get("max_window", 362)), str(kw.get("skip", "")), int(kw.get("detect_every", 2)),
+                str(kw.get("regions", "") or ""), str(kw.get("mode", "refine")))
 
     @classmethod
     def plan(cls, images, kw, device=None):
@@ -176,6 +222,30 @@ class MiniMaxH3FaceRefine:
         if got is not None:
             return got
         n, H, W = int(images.shape[0]), int(images.shape[1]), int(images.shape[2])
+        regions = parse_regions(kw.get("regions", ""))
+        if regions is not None:
+            # 1.8.2: regions drawn by hand: no detector, each one redrawn whatever its size
+            tracks = faces.region_tracks(regions, n, W, H)
+            wins = faces.windows(n, int(kw.get("max_window", 362)))
+            skip = skip_ranges(kw.get("skip", ""))
+            jobs = []
+            for k, (s, f) in enumerate(wins):
+                for c in faces.plan_crops(tracks, s, f, max_face=1e9, min_face=0.0, which="all",
+                                          padding=float(kw.get("region_padding",
+                                                                0.3 if str(kw.get("mode", "refine")) == "swap" else 0.12)),
+                                          follow=str(kw.get("follow", "auto")), ramp=0):
+                    if skip:
+                        fr = np.arange(s, s + f)
+                        for a, b in skip:
+                            c.presence = np.where((fr >= a) & (fr < b), 0.0, c.presence)
+                        if not (c.presence > 0).any():
+                            continue
+                    jobs.append((k, c))
+            plan = {"n": n, "H": H, "W": W, "tracks": tracks, "windows": wins, "jobs": jobs}
+            _FACE_PLANS[key] = plan
+            while len(_FACE_PLANS) > 4:
+                _FACE_PLANS.popitem(last=False)
+            return plan
         if device is None:
             import comfy.model_management as mm
             device = mm.get_torch_device()
@@ -196,8 +266,10 @@ class MiniMaxH3FaceRefine:
         skip = skip_ranges(kw.get("skip", ""))
         jobs = []
         for k, (s, f) in enumerate(wins):
-            for c in faces.plan_crops(tracks, s, f, max_face=float(kw.get("max_face", 150)),
-                                      which=str(kw.get("which", "all")), padding=float(kw.get("padding", 0.8)),
+            swap = str(kw.get("mode", "refine")) == "swap"        # 1.9.0: any size, the largest unless told
+            for c in faces.plan_crops(tracks, s, f, max_face=1e9 if swap else float(kw.get("max_face", 150)),
+                                      which=str(kw.get("which", "largest" if swap else "all")),
+                                      padding=float(kw.get("padding", 0.8)),
                                       follow=str(kw.get("follow", "auto"))):
                 if skip:
                     fr = np.arange(s, s + f)
@@ -220,16 +292,34 @@ class MiniMaxH3FaceRefine:
         s, f = plan["windows"][k]
         win = images[s:s + min(f, plan["n"] - s)]
         audio = audio_slice(kw.get("latent"), s, f)
-        ref = kw.get("ref_image")
+        ref, text = MiniMaxH3FaceRefine.job_ref_text(c, kw)
         return "f" + _n._digest([
-            str(kw.get("cache_key", "")), str(kw.get("text", "")), s, f, round(float(c.side), 1),
+            str(kw.get("cache_key", "")), text, s, f, round(float(c.side), 1),
             round(float(np.median(c.cx)), 1), round(float(np.median(c.cy)), 1), bool(c.follow),
             int(kw.get("work_size", 640)), bool(kw.get("hold_audio", True)), int(getattr(noise, "seed", 0) or 0),
             faces.region_hash(win, faces._slice_crop(c, 0, win.shape[0])),
             _n._digest(audio) if audio is not None else "", _n._digest(ref) if ref is not None else ""])[:24]
 
+    @staticmethod
+    def job_ref_text(c, kw):
+        """1.9.0: the identity picture and the prompt of one crop. A region may name its ref
+        (1-4) and label; swap without a text of its own gets the swap prompt per face."""
+        tr = c.track
+        k = int(getattr(tr, "ref", 0) or 0)
+        ref = kw.get(REF_INPUTS[k - 1]) if 1 <= k <= len(REF_INPUTS) else None
+        if ref is None:
+            ref = kw.get("ref_image")
+        text = str(kw.get("text") or "").strip()
+        if not text:
+            if str(kw.get("mode", "refine")) == "swap":
+                text = swap_prompt(getattr(tr, "label", "") or "", getattr(tr, "describe", "") or "")
+            else:
+                text = face_prompt(with_ref=ref is not None)
+        return ref, text
+
     def check_lazy_status(self, images, model=None, clip=None, vae=None, noise=None, sampler=None,
                           sigmas=None, **kw):
+        # (1.8.2: with regions, the detector isn't needed)
         have = {"model": model, "clip": clip, "vae": vae, "noise": noise, "sampler": sampler, "sigmas": sigmas}
         if not kw.get("enabled", True):
             return []
@@ -263,12 +353,16 @@ class MiniMaxH3FaceRefine:
         report["windows"] = [list(w) for w in plan["windows"]]
         report["tracks"] = [t.as_dict() for t in plan["tracks"]]
         if not plan["jobs"]:
-            report["note"] = "no small faces"
+            report["note"] = ("no regions" if parse_regions(kw.get("regions", "")) is not None
+                              else "no faces" if str(kw.get("mode", "refine")) == "swap" else "no small faces")
             return self._out(images, report)
         if vae is None:
             raise ValueError("MiniMax H3 Face Refine needs the video VAE.")
-        ref = kw.get("ref_image")
-        text = str(kw.get("text") or "").strip() or face_prompt(with_ref=ref is not None)
+        if str(kw.get("mode", "refine")) == "swap":
+            lost = [i + 1 for i, (_k, c) in enumerate(plan["jobs"]) if self.job_ref_text(c, kw)[0] is None]
+            if lost:
+                raise ValueError("MiniMax H3 Face Refine (swap): every face needs a ref image (the ref2va model). "
+                                 "Connect ref_image (and ref_image_2… for regions with \"ref\": 2…).")
         work = max(256, int(kw.get("work_size", 640)) // 32 * 32)
         n = plan["n"]
         weights = faces.window_weights(plan["windows"], n)
@@ -297,6 +391,7 @@ class MiniMaxH3FaceRefine:
             if v is None:
                 if model is None or clip is None or sigmas is None or sampler is None or noise is None:
                     raise ValueError("MiniMax H3 Face Refine needs the model, CLIP, noise, sampler and sigmas.")
+                ref, text = self.job_ref_text(c, kw)
                 v = self.redraw(model, clip, vae, noise, sampler, sigmas, crop, audio_slice(kw.get("latent"), s, f),
                                 text, f, work, ref, bool(kw.get("hold_audio", True)), i)
                 if keep:
@@ -384,8 +479,8 @@ class MiniMaxH3FaceRefine:
 class _Faces:
     """What faces.face_mask needs: a face box per frame and how present it is."""
 
-    def __init__(self, face, presence):
-        self.face, self.presence = face, presence
+    def __init__(self, face, presence, shape="oval"):
+        self.face, self.presence, self.shape = face, presence, shape
 
 
 def _boxes_per_frame(rows, frames, sx=1.0, sy=1.0):
@@ -470,18 +565,97 @@ class MiniMaxH3PasteFaces:
             sx = W / float(it.get("w") or W)
             sy = H / float(it.get("h") or H)
             mask = torch.zeros(cnt, H, W)
-            for face in it.get("faces") or ([it["boxes"]] if it.get("boxes") else []):
+            shapes = it.get("shapes") or []
+            for j, face in enumerate(it.get("faces") or ([it["boxes"]] if it.get("boxes") else [])):
                 shifted = [[r[0] - frm] + list(r[1:5]) for r in face]
                 box, presence = _boxes_per_frame(shifted, cnt, sx, sy)
                 if box is None:
                     continue
-                m = faces.face_mask(_Faces(box, presence), H, W, scale=float(mask_scale), feather=float(feather))
+                rect = j < len(shapes) and shapes[j] == "rect"       # 1.8.2: a region drawn by hand
+                m = faces.face_mask(_Faces(box, presence, "rect" if rect else "oval"), H, W,
+                                    scale=float(mask_scale) if not rect else 1.04, feather=float(feather))
                 mask = torch.maximum(mask, m)
             seg = out[at:at + cnt]
             out[at:at + cnt] = seg + (clip[:cnt].to(seg) - seg) * mask[..., None].to(seg)
         return (out.clamp_(0, 1),)
 
 
-NODE_CLASS_MAPPINGS = {"MiniMaxH3FaceRefine": MiniMaxH3FaceRefine, "MiniMaxH3PasteFaces": MiniMaxH3PasteFaces}
+class MiniMaxH3LoadVideo:
+    """1.9.0: any video from ComfyUI's input folder, at H3's 24 fps (ffmpeg drops or repeats
+    frames as needed), as frames and its sound, for Face Refine (face swap). Frame n is at
+    n / 24 s, so boxes drawn in a player line up."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {
+            "video": ("STRING", {"default": "", "tooltip": "A file in ComfyUI's input folder, e.g. "
+                                 "longshot/my-project/clip.mp4."}),
+        }, "optional": {
+            "max_seconds": ("FLOAT", {"default": 60.0, "min": 1.0, "max": 600.0, "step": 1.0,
+                                      "tooltip": "Only this much of it (every frame is held in RAM)."}),
+        }}
+
+    RETURN_TYPES = ("IMAGE", "AUDIO", "INT")
+    RETURN_NAMES = ("images", "audio", "frames")
+    FUNCTION = "load"
+    CATEGORY = "MiniMax H3"
+
+    @staticmethod
+    def _path(video):
+        import folder_paths
+        root = os.path.realpath(folder_paths.get_input_directory())
+        rel = str(video or "").replace("\\", "/").strip("/")
+        path = os.path.realpath(os.path.join(root, *rel.split("/"))) if rel else ""
+        if not rel or not path.startswith(root + os.sep) or not os.path.isfile(path):
+            raise ValueError(f"MiniMax H3 Load Video: {rel or 'no file'} isn't in ComfyUI's input folder.")
+        return path
+
+    @classmethod
+    def IS_CHANGED(cls, video="", max_seconds=60.0):
+        try:
+            p = cls._path(video)
+            return f"{p}|{os.path.getmtime(p)}|{os.path.getsize(p)}|{max_seconds}"
+        except ValueError:
+            return float("nan")
+
+    def load(self, video="", max_seconds=60.0):
+        import re
+        import subprocess
+        path = self._path(video)
+        ffmpeg = _n._ffmpeg_exe()
+        if not ffmpeg:
+            raise ValueError("ffmpeg isn't available. Install it (or pip install imageio-ffmpeg).")
+        flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        info = subprocess.run([ffmpeg, "-hide_banner", "-i", path], capture_output=True, creationflags=flags)
+        text = info.stderr.decode("utf-8", "replace")
+        m = re.search(r"Video:.*?(\d{2,5})x(\d{2,5})", text)
+        if not m:
+            raise ValueError(f"MiniMax H3 Load Video: no video stream in {os.path.basename(path)}.")
+        W, H = int(m.group(1)) // 2 * 2, int(m.group(2)) // 2 * 2
+        secs = f"{float(max_seconds):.3f}"
+        res = subprocess.run([ffmpeg, "-v", "error", "-i", path, "-t", secs, "-an",
+                              "-vf", f"fps=24,scale={W}:{H}:flags=bicubic", "-f", "rawvideo", "-pix_fmt", "rgb24", "-"],
+                             capture_output=True, creationflags=flags)
+        if res.returncode != 0:
+            raise ValueError(f"Couldn't read {os.path.basename(path)}: {res.stderr.decode('utf-8', 'replace')[-300:]}")
+        n = len(res.stdout) // (W * H * 3)
+        if n < 1:
+            raise ValueError(f"MiniMax H3 Load Video: {os.path.basename(path)} has no frames.")
+        frames = torch.from_numpy(np.frombuffer(res.stdout[:n * W * H * 3], np.uint8).reshape(n, H, W, 3).copy()).float() / 255.0
+        rate = 44100
+        snd = subprocess.run([ffmpeg, "-v", "error", "-i", path, "-t", f"{n / 24.0:.4f}", "-vn", "-ac", "2", "-ar", str(rate),
+                              "-f", "f32le", "-"], capture_output=True, creationflags=flags)
+        want = int(round(n / 24.0 * rate))
+        wav = np.frombuffer(snd.stdout, np.float32) if snd.returncode == 0 and snd.stdout else np.zeros(0, np.float32)
+        wav = wav[: len(wav) // 2 * 2].reshape(-1, 2).T if wav.size else np.zeros((2, 0), np.float32)
+        if wav.shape[1] < want:
+            wav = np.concatenate([wav, np.zeros((2, want - wav.shape[1]), np.float32)], 1)
+        audio = {"waveform": torch.from_numpy(wav[:, :want].copy())[None], "sample_rate": rate}
+        return (frames, audio, n)
+
+
+NODE_CLASS_MAPPINGS = {"MiniMaxH3FaceRefine": MiniMaxH3FaceRefine, "MiniMaxH3PasteFaces": MiniMaxH3PasteFaces,
+                       "MiniMaxH3LoadVideo": MiniMaxH3LoadVideo}
 NODE_DISPLAY_NAME_MAPPINGS = {"MiniMaxH3FaceRefine": "MiniMax H3 Face Refine",
-                              "MiniMaxH3PasteFaces": "MiniMax H3 Paste Faces"}
+                              "MiniMaxH3PasteFaces": "MiniMax H3 Paste Faces",
+                              "MiniMaxH3LoadVideo": "MiniMax H3 Load Video (24 fps)"}

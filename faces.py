@@ -337,13 +337,55 @@ class Track:
         i = int(np.clip(f - self.first, 0, len(self.cx) - 1))
         return self.cx[i], self.cy[i], self.w[i], self.h[i]
 
+    shape = "oval"                    # 1.8.2: "rect" for a region drawn by hand
+
     def as_dict(self, every=4):
         rows = []
         for i in range(0, len(self.cx), every):
             rows.append([self.first + i, round(float(self.cx[i]), 1), round(float(self.cy[i]), 1),
                          round(float(self.w[i]), 1), round(float(self.h[i]), 1)])
         return {"id": self.id, "first": self.first, "last": self.last, "size": round(self.size(), 1),
-                "boxes": rows}
+                "boxes": rows, "shape": self.shape}
+
+
+def region_tracks(regions, n_frames, W, H, first_id=1000):
+    """1.8.2: tracks from regions drawn by hand instead of found faces. regions: a list of
+    {"keys": [[frame, x, y, w, h], ...]} with x, y, w, h as fractions of the frame (top-left
+    corner, size); the box goes in a straight line from one key frame to the next (held
+    before the first and after the last). Each becomes a "rect" track over every frame."""
+    out = []
+    for k, r in enumerate(regions or []):
+        keys = r.get("keys") if isinstance(r, dict) else r
+        rows = []
+        for row in keys or []:
+            try:
+                fr, x, y, w, h = (float(v) for v in list(row)[:5])
+            except (TypeError, ValueError):
+                continue
+            if w <= 0 or h <= 0:
+                continue
+            x, y = min(max(x, 0.0), 1.0), min(max(y, 0.0), 1.0)
+            w, h = min(w, 1.0 - x), min(h, 1.0 - y)
+            if w <= 0 or h <= 0:
+                continue
+            rows.append((min(max(fr, 0.0), n_frames - 1.0), (x + w / 2) * W, (y + h / 2) * H, w * W, h * H))
+        if not rows:
+            continue
+        rows.sort(key=lambda t: t[0])
+        fr = np.array([t[0] for t in rows])
+        grid = np.arange(n_frames, dtype=np.float64)
+        cx, cy, w, h = (np.interp(grid, fr, [t[i] for t in rows]) for i in (1, 2, 3, 4))
+        t = Track(first_id + k, 0, cx, cy, w, h, np.ones(n_frames, bool), np.zeros((n_frames, 5, 2)))
+        meta = r if isinstance(r, dict) else {}
+        t.shape = "oval" if meta.get("shape") == "oval" else "rect"      # 1.9.0: a face box (swap) is oval
+        try:
+            t.ref = int(meta.get("ref") or 0)                            # 1.9.0: which ref image (1-4)
+        except (TypeError, ValueError):
+            t.ref = 0
+        t.label = str(meta.get("label") or "")[:120]
+        t.describe = str(meta.get("describe") or "")[:300]
+        out.append(t)
+    return out
 
 
 def build_tracks(dets, n_frames, max_gap=12, min_hits=3, sigma=2.0):
@@ -474,17 +516,18 @@ class Crop:
     """One face in one window: a square region per frame (centre, side), the face box per
     frame (for its mask) and how present the face is on each frame (0..1)."""
 
-    def __init__(self, track, start, frames, cx, cy, side, face, presence, follow):
+    def __init__(self, track, start, frames, cx, cy, side, face, presence, follow, shape=None):
         self.track, self.start, self.frames = track, start, frames
         self.cx, self.cy, self.side = cx, cy, side          # per frame (side is fixed)
         self.face = face                                    # [T,4]: cx, cy, w, h
         self.presence = presence                            # [T] 0..1
         self.follow = follow
+        self.shape = shape or getattr(track, "shape", "oval")   # 1.8.2: "rect" for a region
 
     def as_dict(self):
         return {"track": self.track.id, "start": self.start, "frames": self.frames,
                 "side": round(float(self.side), 1), "follow": bool(self.follow),
-                "size": round(self.track.size(), 1),
+                "size": round(self.track.size(), 1), "shape": self.shape,
                 "box": [round(float(np.median(self.cx)), 1), round(float(np.median(self.cy)), 1)]}
 
 
@@ -626,17 +669,24 @@ def match_color(refined, original, strength=1.0, sigma=None):
 def face_mask(crop, H, W, *, scale=1.0, feather=0.3, device="cpu", rect=None):
     """Soft elliptical masks [T,h,w] over the face on each frame (inside `rect` =
     (x0, y0, x1, y1) of the picture, or all of it): 1 on the face, fading out over
-    `feather` of its radius, times the face's presence."""
+    `feather` of its radius, times the face's presence. 1.8.2: a "rect" crop (a region
+    drawn by hand) gets a soft rectangle over its box instead."""
     x0, y0, x1, y1 = rect or (0, 0, W, H)
     ys = torch.arange(y0, y1, device=device, dtype=torch.float32)[None, :, None] + 0.5
     xs = torch.arange(x0, x1, device=device, dtype=torch.float32)[None, None, :] + 0.5
     f = torch.as_tensor(crop.face, dtype=torch.float32, device=device)
     cx, cy, w, h = f[:, 0, None, None], f[:, 1, None, None], f[:, 2, None, None], f[:, 3, None, None]
-    # MTCNN's box runs brow to chin: the ellipse reaches a little above and to the sides
-    a = 0.5 * w * 1.15 * scale
-    b = 0.5 * h * 1.30 * scale
-    cy = cy - 0.06 * h
-    r = torch.sqrt(((xs - cx) / a) ** 2 + ((ys - cy) / b) ** 2)
+    if getattr(crop, "shape", "oval") == "rect":
+        # the box itself (a little bigger with mask_scale), its edge softened inward
+        a = (0.5 * w * scale).clamp(min=1.0)
+        b = (0.5 * h * scale).clamp(min=1.0)
+        r = torch.maximum((xs - cx).abs() / a, (ys - cy).abs() / b)
+    else:
+        # MTCNN's box runs brow to chin: the ellipse reaches a little above and to the sides
+        a = 0.5 * w * 1.15 * scale
+        b = 0.5 * h * 1.30 * scale
+        cy = cy - 0.06 * h
+        r = torch.sqrt(((xs - cx) / a) ** 2 + ((ys - cy) / b) ** 2)
     fe = max(0.02, float(feather))
     m = ((1.0 + fe * 0.5 - r) / fe).clamp(0, 1)
     m = m * m * (3 - 2 * m)                                 # smoothstep
@@ -682,4 +732,4 @@ def paste_delta(frames, refined, crop, *, scale=1.0, feather=0.3, device=None):
 
 def _slice_crop(crop, a, b):
     return Crop(crop.track, crop.start + a, b - a, crop.cx[a:b], crop.cy[a:b], crop.side,
-                crop.face[a:b], crop.presence[a:b], crop.follow)
+                crop.face[a:b], crop.presence[a:b], crop.follow, getattr(crop, "shape", None))
