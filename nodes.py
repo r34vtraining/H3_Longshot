@@ -3305,6 +3305,10 @@ class MiniMaxH3LoadVideo:
             "width": ("INT", {"default": 0, "min": 0, "max": 16384, "tooltip": "0: the clip's own size."}),
             "height": ("INT", {"default": 0, "min": 0, "max": 16384}),
             "force_rate": ("FLOAT", {"default": 24.0, "min": 1.0, "max": 240.0}),
+        }, "optional": {
+            # 1.9.1: one Load Video again (1.9.0's Face Refine copy took its name and lost these)
+            "max_seconds": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 3600.0, "step": 1.0,
+                                      "tooltip": "0: no limit. Otherwise at most this much (every frame is held in RAM)."}),
         }}
 
     RETURN_TYPES = ("IMAGE", "INT", "AUDIO")
@@ -3322,7 +3326,8 @@ class MiniMaxH3LoadVideo:
         except Exception:
             return float("nan")
 
-    def load(self, video, skip_first_frames=0, frame_load_cap=0, width=0, height=0, force_rate=24.0, _ffmpeg=None):
+    def load(self, video, skip_first_frames=0, frame_load_cap=0, width=0, height=0, force_rate=24.0,
+             max_seconds=0.0, _ffmpeg=None):
         import os
         import subprocess
         import numpy as np
@@ -3342,6 +3347,9 @@ class MiniMaxH3LoadVideo:
             width, height = int(m.group(1)), int(m.group(2))
         w, h = int(width) // 2 * 2, int(height) // 2 * 2
         skip, cap = int(skip_first_frames), int(frame_load_cap)
+        if max_seconds and float(max_seconds) > 0:
+            most = max(1, int(round(float(max_seconds) * float(force_rate))))
+            cap = min(cap, most) if cap else most
         trim = f"trim=start_frame={skip}" + (f":end_frame={skip + cap}" if cap else "")
         vf = f"fps={force_rate},{trim},setpts=PTS-STARTPTS,scale={w}:{h}:flags=bicubic"
         # 1.8.1: -vsync 0, or some ffmpeg builds pad the end with a few repeated frames

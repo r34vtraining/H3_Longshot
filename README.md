@@ -1,5 +1,12 @@
 # ComfyUI — MiniMax H3 Long Shot
 
+## What's new in 1.9.1
+
+- **One MiniMax H3 Load Video again.** 1.9.0's Face Refine brought its own Load Video under the same
+  name, which replaced the original: files in the output folder (`… [output]`, e.g. a refined face
+  clip) were refused, and a Clip Shot's start, length and size were ignored. The original is back,
+  with a new optional `max_seconds` (0 = no limit) for face swaps on footage.
+
 ## What's new in 1.9.0
 
 - **Face swap** in MiniMax H3 Face Refine (`mode: swap`, the ref2va model): each face is given the
