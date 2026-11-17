@@ -489,6 +489,77 @@ def _add_tail_guide(positive, cumulative, seg, song_audio=None):
     return _set_keyframes(positive, kfs)
 
 
+# ---------------------------------------------------------------------------
+# 1.10.0: Handoff care. A continuing piece is pinned to the tail of the one before it, so
+# whatever drifted there (colour, brightness, grain) is matched and handed on again, and it
+# builds up along a long chain. Before the tail is pinned:
+#   * refresh: the tail is noised to `tail_refresh` and denoised again in a few steps with the
+#     references and the Shot's text, which redraws fresh detail on the same motion;
+#   * colour lock: each latent channel's mean and spread is pulled toward those of the tail of
+#     the chain's first piece (its baseline), at `colour_lock` strength.
+# A Shot with colour_reset lets its colour change (lights go off) and is the new baseline.
+# Settings come per Shot (Studio sends the film's own values on every Shot).
+# ---------------------------------------------------------------------------
+
+def _handoff_of(sh):
+    """A Shot's handoff settings, or None when there's nothing to do."""
+    try:
+        lock = min(1.0, max(0.0, float(sh.get("colour_lock") or 0.0)))
+        refresh = min(0.9, max(0.0, float(sh.get("tail_refresh") or 0.0)))
+        steps = max(1, min(50, int(sh.get("refresh_steps") or 4)))
+    except (TypeError, ValueError):
+        return None
+    reset = bool(sh.get("colour_reset"))
+    if not (lock > 0 or refresh > 0 or reset):
+        return None
+    return {"lock": lock, "refresh": refresh, "steps": steps, "reset": reset}
+
+
+def _colour_match(tail, base, strength):
+    """Each channel of `tail` (B, C, T, H, W) moved toward the mean and spread of `base`."""
+    if strength <= 0:
+        return tail
+    t = tail.float()
+    b = base.float().to(t.device)
+    dims = (0, 2, 3, 4)
+    mt, st = t.mean(dim=dims, keepdim=True), t.std(dim=dims, keepdim=True)
+    mb, sb = b.mean(dim=dims, keepdim=True), b.std(dim=dims, keepdim=True)
+    matched = (t - mt) / st.clamp_min(1e-5) * sb + mb
+    return (t + (matched - t) * float(strength)).to(tail.dtype)
+
+
+def _colour_ramp(v, base, strength):
+    """1.10.1: colour lock on a piece's own frames, not on what it's pinned to. Each channel's
+    mean and spread move toward `base` (the chain's first tail) over the piece: nothing at its
+    first frame (so it still meets the Shot before exactly), the full step at its last. Each
+    piece moves at most a bounded step, so a big gap closes over a few pieces, never in a jump."""
+    if strength <= 0:
+        return v
+    t = v.float()
+    b = base.float().to(t.device)
+    dims = (0, 2, 3, 4)
+    tail = t[:, :, -b.shape[2]:]
+    mt, st = tail.mean(dim=dims, keepdim=True), tail.std(dim=dims, keepdim=True)
+    mb, sb = b.mean(dim=dims, keepdim=True), b.std(dim=dims, keepdim=True)
+    ok = st > 1e-3
+    ratio = torch.where(ok, sb / st.clamp_min(1e-3), torch.ones_like(st)).clamp(0.8, 1.25)
+    shift = (mb - mt).clamp(-0.5 * st, 0.5 * st)
+    T = t.shape[2]
+    w = torch.linspace(0.0, 1.0, T, device=t.device, dtype=t.dtype).view(1, 1, T, 1, 1) * float(strength)
+    out = mt + (t - mt) * (1 + (ratio - 1) * w) + shift * w
+    return out.to(v.dtype)
+
+
+def _refresh_sigmas(model, steps, denoise):
+    """The last `steps` sigmas of a schedule that would take steps / denoise in all, as
+    BasicScheduler does for a denoise below 1."""
+    import comfy.samplers
+    total = max(steps, int(round(steps / max(0.01, denoise))))
+    ms = model.get_model_object("model_sampling")
+    sig = comfy.samplers.calculate_sigmas(ms, "simple", total).cpu()
+    return sig[-(steps + 1):]
+
+
 def _extra_ref_blocks(extra_refs):
     """Reference blocks carried by an external conditioning (e.g. Apply H3 RefMod)."""
     if not extra_refs:
@@ -1717,6 +1788,13 @@ def _prepare_timeline(*, shots, bundle, refs, labels, native_refs, model, clip, 
                                           _digest(a1) if a1 is not None else None])
         if cx is not None:
             comps[i]["frames"] = _digest([comps[i]["frames"], "context", _digest(cx)])
+    # 1.10.0: handoff care changes what a continuing piece is pinned to
+    handoff = [_handoff_of(sh) if kinds[i] != "clip" else None for i, sh in enumerate(shots)]
+    for i, h in enumerate(handoff):
+        if h is not None and i and joins[i] == "bridge":
+            comps[i]["frames"] = _digest([comps[i]["frames"], "handoff", h["lock"], h["refresh"],
+                                          h["steps"] if h["refresh"] else 0, h["reset"]]
+                                         + (["ramp"] if h["lock"] else []))   # 1.10.1: a new lock
 
     # Pins and fingerprints, left to right.
     ov = overlap_frames
@@ -1838,7 +1916,7 @@ def _prepare_timeline(*, shots, bundle, refs, labels, native_refs, model, clip, 
         labels=labels, extra_blocks=extra_blocks, bundle=bundle, ids=ids, joins=joins,
         locks=locks, starts=starts, ends=ends, seams=seams, legacy=legacy, prevs=prevs, kinds=kinds,
         take_names=take_names, save=save_to_disk, recipe=recipe, overlap=ov, anchors=anchors,
-        song_shifts=shifts, song_ref=song_ref, song_at=song_at,
+        song_shifts=shifts, song_ref=song_ref, song_at=song_at, handoff=handoff,
         refine=dict(mode=rmode, key=rkey, skip=rskip, model_name=mname, new=refine_new,
                     locked=refine_locked, have=refined_have, store=rstore))
 
@@ -2049,7 +2127,7 @@ def _run_timeline(p, *, model, clip, vae, audio_vae, noise, sampler, sigmas, wid
                     raise ValueError(f"{_shot_label(i)} already has a guide inside its shared "
                                      f"zone, which would fight the continuation.")
             kfs.append({"resolved_frame_index": 0,
-                        "latent": lv[:, :, -ovt:].clone(),
+                        "latent": handoff_tail(i, st["from"]),
                         "audio_latent": (song_span(seg.window_start, seg.window_end, shifts[i])
                                          if song is not None else zone_audio(st["from"], True).clone())})
         elif song is not None:
@@ -2079,6 +2157,46 @@ def _run_timeline(p, *, model, clip, vae, audio_vae, noise, sampler, sigmas, wid
         if kfs:
             positive = _set_keyframes(positive, kfs)
         return positive, end_v, end_a
+
+    HO = getattr(p, "handoff", None) or [None] * n
+    handed = {}
+
+    def chain_base(j):
+        """The piece whose tail is the colour baseline for a chain reaching piece j."""
+        while p.starts[j] is not None and not (HO[j] and HO[j]["reset"]):
+            j = p.starts[j]["from"]
+        return j
+
+    def handoff_tail(i, j):
+        """1.10.0: piece j's tail as piece i is pinned to it: refreshed and colour-locked when
+        i's handoff settings say so. Made once per run for each pair."""
+        tail = placed[j][0][:, :, -ovt:].clone()
+        h = HO[i]
+        if h is None or not h["refresh"] or kinds_of(j) == "clip":
+            return tail
+        key = (i, j)
+        if key in handed:
+            return handed[key].clone()
+        if h["refresh"] > 0 and kinds_of(j) != "clip":
+            logger.info("MiniMax H3 Long Shot: refreshing the handoff into %s (denoise %.2f, %d steps)",
+                        _shot_label(i), h["refresh"], h["steps"])
+            src = prompts[j]
+            a0, a1, cx = p.anchors[j] if getattr(p, "anchors", None) else (None, None, None)
+            pos = encoder.encode(src.prompt, ov, extra_images=[a0, a1, cx])
+            pos = _add_ref_blocks(pos, p.extra_blocks)
+            audio = _fit_audio(zone_audio(j, True).clone(), planner.audio_at(ov))
+            sig = _refresh_sigmas(model, h["steps"], h["refresh"])
+            out = _sample_window(model, _segment_noise(noise, seeds[i]), sampler, sig, pos,
+                                 {"samples": NestedTensor((tail.float(), audio.float()))})
+            tail = out["samples"].tensors[0].to(placed[j][0])
+            if tail.shape[2] != ovt:
+                raise RuntimeError(f"The refreshed handoff into {_shot_label(i)} has {tail.shape[2]} "
+                                   f"video tokens; expected {ovt}.")
+        handed[key] = tail
+        return tail.clone()
+
+    def kinds_of(j):
+        return p.kinds[j]
 
     R = getattr(p, "refine", None) or {}
 
@@ -2183,6 +2301,11 @@ def _run_timeline(p, *, model, clip, vae, audio_vae, noise, sampler, sigmas, wid
             sampled = {"samples": NestedTensor((v, a))}
         if R.get("new"):
             v, a = refine_window(i, positive, v, a, end_v, end_a)
+            sampled = {"samples": NestedTensor((v, a))}
+        h = HO[i]
+        if st is not None and end_v is None and h and h["lock"] > 0 and not h["reset"]:
+            # 1.10.1: the piece eases back to the chain's colour by its end (its start untouched)
+            v = _colour_ramp(v, placed[chain_base(st["from"])][0][:, :, -ovt:], h["lock"])
             sampled = {"samples": NestedTensor((v, a))}
         _LAST_TIMELINE[p.ids[i]] = {"comps": p.components[i], "start": p.prevs[i],
                                     "end": _pin_identity(en)}
@@ -2504,6 +2627,11 @@ class MiniMaxH3TimelineShot:
                               "retention_analysis lines for this Shot only, added after the shared "
                               "ones. E.g. '<Picture 4> (reference for [Shot 1]): weak_reference - …' "
                               "for a context picture."}),
+                # 1.10.0: handoff care (see _handoff_of)
+                "colour_lock": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.05, "tooltip": "1.10.0: when this Shot continues from the one before, pull the colour and brightness of the frames it's pinned to back toward the start of the chain (0: off, 1: full). Stops colour and brightness burn building up over a long chain."}),
+                "tail_refresh": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 0.9, "step": 0.05, "tooltip": "1.10.0: redraw the frames this Shot is pinned to at this denoise before pinning them (0: off; about 0.25), which cleans the grain that builds up over a long chain."}),
+                "refresh_steps": ("INT", {"default": 4, "min": 1, "max": 50, "tooltip": "1.10.0: steps for tail_refresh."}),
+                "colour_reset": ("BOOLEAN", {"default": False, "tooltip": "1.10.0: let this Shot's colour and light change (no colour lock into it); the Shots after it lock to it instead."}),
             },
         }
 
@@ -2514,7 +2642,8 @@ class MiniMaxH3TimelineShot:
 
     def add(self, shot_id, seconds, text, shot_seed=-1, lock="", join="bridge", frames=0,
             shots=None, start_image=None, end_image=None, context_image=None, retention="",
-            song_gap="", song_at=-1.0):
+            song_gap="", song_at=-1.0, colour_lock=0.0, tail_refresh=0.0, refresh_steps=4,
+            colour_reset=False):
         chain = list(shots) if shots else []
         if not str(shot_id).strip():
             logger.warning("MiniMax H3 Timeline Shot %d has no shot_id; it is filed as shot%d, "
@@ -2546,6 +2675,14 @@ class MiniMaxH3TimelineShot:
             chain[-1]["song_gap"] = _gap_text(song_gap)
         if song_at is not None and float(song_at) >= 0:   # 1.6.18: only when given
             chain[-1]["song_at"] = round(float(song_at), 4)
+        # 1.10.0: handoff care, only when on (older chains keep their fingerprints)
+        if float(colour_lock or 0) > 0:
+            chain[-1]["colour_lock"] = round(float(colour_lock), 3)
+        if float(tail_refresh or 0) > 0:
+            chain[-1]["tail_refresh"] = round(float(tail_refresh), 3)
+            chain[-1]["refresh_steps"] = int(refresh_steps or 4)
+        if colour_reset:
+            chain[-1]["colour_reset"] = True
         return (chain,)
 
 

@@ -1,5 +1,26 @@
 # ComfyUI — MiniMax H3 Long Shot
 
+## What's new in 1.10.1
+
+- **Colour lock no longer touches what a Shot is pinned to.** In 1.10.0 it changed the frames a
+  Continuous Shot continues from, and a big change made the model lose them (a close-up continued
+  as a wide shot). Now the frames it's pinned to are exactly the Shot before's, and the lock works
+  on the Shot's own frames instead: nothing at its first frame, easing toward the chain's colour by
+  its last, by a bounded step per Shot. Not used on a Shot whose end is pinned to the Shot after it.
+
+## What's new in 1.10.0
+
+- **Handoff care** for long Continuous chains, per Timeline Shot (H3 Long Shot Studio sends the
+  film's settings on every Shot). Before a Shot is pinned to the tail of the one before it:
+  - `tail_refresh` (denoise, 0 = off; about 0.25) with `refresh_steps` (4): the tail is redrawn
+    with the references and that Shot's text, cleaning the grain that builds up piece by piece.
+  - `colour_lock` (0–1): each latent channel's mean and spread is pulled toward the tail of the
+    chain's first piece, so colour and brightness burn can't compound.
+  - `colour_reset`: this Shot may change colour and light; the Shots after it lock to it.
+  Only the start pin is treated; a Bridge's end pin stays exactly the Shot after it, so the seam
+  still matches. Turning these on or changing them re-renders the continuing Shots that aren't
+  locked.
+
 ## What's new in 1.9.1
 
 - **One MiniMax H3 Load Video again.** 1.9.0's Face Refine brought its own Load Video under the same
