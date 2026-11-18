@@ -1,5 +1,10 @@
 # ComfyUI — MiniMax H3 Long Shot
 
+## What's new in 1.10.2
+
+- Upscale Chunk at scale 1 (encode only, e.g. after RelayVSR in H3 Long Shot Studio) logs "encode
+  only (no upscale)" instead of "through the RTX node".
+
 ## What's new in 1.10.1
 
 - **Colour lock no longer touches what a Shot is pinned to.** In 1.10.0 it changed the frames a

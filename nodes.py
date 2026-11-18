@@ -3250,8 +3250,11 @@ class MiniMaxH3UpscaleChunk:
             else:
                 upscale = _upscale or _upscaler(scale, quality)
                 step = max(1, int(batch) or 24)
-                logger.info("Upscale Chunk: frames %d-%d, through the RTX node, %d frames per call",
-                            start, start + count - 1, step)
+                if float(scale) <= 1.0:            # 1.10.2: say what it does at scale 1
+                    logger.info("Upscale Chunk: frames %d-%d, encode only (no upscale)", start, start + count - 1)
+                else:
+                    logger.info("Upscale Chunk: frames %d-%d, through the RTX node, %d frames per call",
+                                start, start + count - 1, step)
                 for i in range(0, count, step):
                     mm.throw_exception_if_processing_interrupted()
                     up = upscale(part[i:i + step])
